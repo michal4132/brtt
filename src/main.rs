@@ -58,7 +58,7 @@ fn parse_scan_region(
 
 #[derive(Debug, clap::Parser)]
 #[clap(
-    name = "brrt",
+    name = "brtt",
     about = "Better RTT (Real-Time Transfer) client",
     version = clap::crate_version!(),
 )]
