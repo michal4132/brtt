@@ -209,16 +209,22 @@ fn main() -> Result<()> {
         terminal::enable_raw_mode()?;
     }
 
-    let r = loop {
+    let r = 'read_loop: loop {
+        let mut had_activity = false;
         if let Some(up_channel) = rtt.up_channel(up_channel) {
-            let count = match up_channel.read(&mut core, up_buf.as_mut()) {
-                Ok(count) => count,
-                Err(err) => {
-                    break Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
-                }
-            };
+            loop {
+                let count = match up_channel.read(&mut core, up_buf.as_mut()) {
+                    Ok(count) => count,
+                    Err(err) => {
+                        break 'read_loop Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
+                    }
+                };
 
-            if count > 0 {
+                if count == 0 {
+                    break;
+                }
+                had_activity = true;
+
                 let mut processed_buf = Vec::new();
                 for &byte in &up_buf[..count] {
                     if byte == b'\n' {
@@ -232,20 +238,20 @@ fn main() -> Result<()> {
                         stdout().flush().ok();
                     }
                     Err(err) => {
-                        break Err(anyhow::anyhow!("Error writing to stdout: {err}"));
+                        break 'read_loop Err(anyhow::anyhow!("Error writing to stdout: {err}"));
                     }
                 }
             }
         }
 
-        if let Some(down_channel) = rtt.down_channel(down_channel) {
-            if event::poll(Duration::from_millis(10))? {
+        if let Some(_down_channel) = rtt.down_channel(down_channel) {
+            if event::poll(Duration::from_millis(0))? {
                 let event = event::read()?;
 
                 let mut bytes = vec![];
                 if let Event::Key(key) = event {
                     if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                        break Ok(Ok(()));
+                        break 'read_loop Ok(Ok(()));
                     }
                     match key.code {
                         KeyCode::Char(c) => bytes.extend_from_slice(&c.to_string().as_bytes()),
@@ -260,13 +266,20 @@ fn main() -> Result<()> {
                     }
                 }
                 down_buf.extend_from_slice(bytes.as_slice());
+                had_activity = true;
             }
+        }
 
+        if !had_activity {
+            std::thread::sleep(Duration::from_micros(50));
+        }
+
+        if let Some(down_channel) = rtt.down_channel(down_channel) {
             if !down_buf.is_empty() {
                 let count = match down_channel.write(&mut core, down_buf.as_mut()) {
                     Ok(count) => count,
                     Err(err) => {
-                        break Err(anyhow::anyhow!("\nError writing to RTT: {err}"));
+                        break 'read_loop Err(anyhow::anyhow!("\nError writing to RTT: {err}"));
                     }
                 };
 
