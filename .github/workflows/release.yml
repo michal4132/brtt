@@ -18,6 +18,8 @@ jobs:
             os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -28,6 +30,12 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y libudev-dev
 
+      - name: Install Windows cross-compilation tools
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+            sudo apt-get update
+            sudo apt-get install -y gcc-mingw-w64-x86-64
+
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -35,13 +43,20 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
-        run: mv target/${{ matrix.target }}/release/brtt target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
+        run: |
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            mv target/${{ matrix.target }}/release/brtt.exe target/${{ matrix.target }}/release/brtt-${{ matrix.target }}.exe
+          else
+            mv target/${{ matrix.target }}/release/brtt target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
+          fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: brtt-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
+            target/${{ matrix.target }}/release/brtt-${{ matrix.target }}.exe
 
   release:
     runs-on: ubuntu-latest
