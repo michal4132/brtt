@@ -249,24 +249,27 @@ fn main() -> Result<()> {
                 let event = event::read()?;
 
                 let mut bytes = vec![];
-                if let Event::Key(key) = event {
-                    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                        break 'read_loop Ok(Ok(()));
-                    }
-                    match key.code {
-                        KeyCode::Char(c) => bytes.extend_from_slice(&c.to_string().as_bytes()),
-                        KeyCode::Enter => bytes.push(b'\n'),
-                        KeyCode::Tab => bytes.push(b'\t'),
-                        KeyCode::Backspace => bytes.push(8u8), // Backspace character
-                        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
-                        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
-                        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
-                        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
-                        _ => {}
+                if let Event::Key(key_event) = event {
+                    // Only process key press events, not releases or repeats
+                    if key_event.kind == event::KeyEventKind::Press {
+                        if key_event.modifiers == KeyModifiers::CONTROL && key_event.code == KeyCode::Char('c') {
+                            break 'read_loop Ok(Ok(()));
+                        }
+                        match key_event.code {
+                            KeyCode::Char(c) => bytes.extend_from_slice(&c.to_string().as_bytes()),
+                            KeyCode::Enter => bytes.push(b'\n'),
+                            KeyCode::Tab => bytes.push(b'\t'),
+                            KeyCode::Backspace => bytes.push(8u8), // Backspace character
+                            KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
+                            KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
+                            KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+                            KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
+                            _ => {}
+                        }
+                        down_buf.extend_from_slice(bytes.as_slice());
+                        had_activity = true;
                     }
                 }
-                down_buf.extend_from_slice(bytes.as_slice());
-                had_activity = true;
             }
         }
 
