@@ -8,8 +8,15 @@ authors = ["Michal Bogdziewicz <michal@bogdziewicz.xyz>"]
 
 [dependencies]
 env_logger = "0.11"
-probe-rs = "0.29.0"
+probe-rs = "0.29.1"
+probe-rs-target = "0.29.1"
 anyhow = "1.0"
 async-io = "2.0"
 clap = { version = "4", features = ["cargo", "derive"] }
 crossterm = "0.27.0"
+zerocopy = { version = "0.8.0", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+docsplay = "0.1.1"
+thiserror = "2.0.11"
+parking_lot = "0.12.2"

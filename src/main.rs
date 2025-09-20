@@ -1,4 +1,9 @@
-use probe_rs::rtt::{Rtt, RttChannel, ScanRegion};
+mod rtt;
+mod channel;
+
+use rtt::{Rtt, ScanRegion};
+use channel::{ChannelMode, RttChannel, UpChannel, DownChannel};
+
 use probe_rs::{Permissions, probe::list::Lister};
 use probe_rs::{config::TargetSelector, probe::DebugProbeInfo};
 
@@ -196,7 +201,7 @@ fn main() -> Result<()> {
         0
     };
 
-    let mut up_buf = [0u8; 1024];
+    let mut up_buf = [0u8; 128];
     let mut down_buf = vec![];
 
     if opts.reset {
@@ -210,7 +215,6 @@ fn main() -> Result<()> {
     }
 
     let r = 'read_loop: loop {
-        let mut had_activity = false;
         if let Some(up_channel) = rtt.up_channel(up_channel) {
             loop {
                 let count = match up_channel.read(&mut core, up_buf.as_mut()) {
@@ -223,7 +227,6 @@ fn main() -> Result<()> {
                 if count == 0 {
                     break;
                 }
-                had_activity = true;
 
                 let mut processed_buf = Vec::new();
                 for &byte in &up_buf[..count] {
@@ -267,14 +270,9 @@ fn main() -> Result<()> {
                             _ => {}
                         }
                         down_buf.extend_from_slice(bytes.as_slice());
-                        had_activity = true;
                     }
                 }
             }
-        }
-
-        if !had_activity {
-            std::thread::sleep(Duration::from_micros(50));
         }
 
         if let Some(down_channel) = rtt.down_channel(down_channel) {
@@ -333,4 +331,3 @@ fn list_channels(channels: &[impl RttChannel]) {
         );
     }
 }
-
