@@ -13,6 +13,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal;
 use std::io::prelude::*;
 use std::io::stdout;
+use std::thread;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -214,20 +215,18 @@ fn main() -> Result<()> {
         terminal::enable_raw_mode()?;
     }
 
-    let r = 'read_loop: loop {
+        let r = 'read_loop: loop {
+        let mut read_data = false;
         if let Some(up_channel) = rtt.up_channel(up_channel) {
-            loop {
-                let count = match up_channel.read(&mut core, up_buf.as_mut()) {
-                    Ok(count) => count,
-                    Err(err) => {
-                        break 'read_loop Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
-                    }
-                };
-
-                if count == 0 {
-                    break;
+            let count = match up_channel.read(&mut core, up_buf.as_mut()) {
+                Ok(count) => count,
+                Err(err) => {
+                    break 'read_loop Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
                 }
+            };
 
+            if count > 0 {
+                read_data = true;
                 let mut processed_buf = Vec::new();
                 for &byte in &up_buf[..count] {
                     if byte == b'\n' {
@@ -255,7 +254,9 @@ fn main() -> Result<()> {
                 if let Event::Key(key_event) = event {
                     // Only process key press events, not releases or repeats
                     if key_event.kind == event::KeyEventKind::Press {
-                        if key_event.modifiers == KeyModifiers::CONTROL && key_event.code == KeyCode::Char('c') {
+                        if key_event.modifiers == KeyModifiers::CONTROL
+                            && key_event.code == KeyCode::Char('c')
+                        {
                             break 'read_loop Ok(Ok(()));
                         }
                         match key_event.code {
