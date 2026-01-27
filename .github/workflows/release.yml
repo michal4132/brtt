@@ -12,67 +12,54 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
-            suffix: ubuntu24
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-            suffix: ""
           - target: aarch64-apple-darwin
             os: macos-latest
-            suffix: ""
           - target: x86_64-pc-windows-gnu
             os: ubuntu-24.04
-            suffix: ""
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            suffix: ubuntu22
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install dependencies
-        if: runner.os == 'Linux'
+      - name: Install musl tools
+        if: contains(matrix.target, 'linux-musl')
         run: |
-            sudo apt-get update
-            sudo apt-get install -y libudev-dev libudev1 pkg-config
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
 
       - name: Install Windows cross-compilation tools
         if: matrix.target == 'x86_64-pc-windows-gnu'
         run: |
-            sudo apt-get update
-            sudo apt-get install -y gcc-mingw-w64-x86-64
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
       - name: Build binary
+        env:
+          RUSTFLAGS: ${{ runner.os == 'macOS' && '-C target-feature=+crt-static' || '' }}
         run: |
           cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            if [[ "${{ matrix.suffix }}" != "" ]]; then
-              mv target/${{ matrix.target }}/release/brtt.exe target/${{ matrix.target }}/release/brtt-${{ matrix.target }}-${{ matrix.suffix }}.exe
-            else
-              mv target/${{ matrix.target }}/release/brtt.exe target/${{ matrix.target }}/release/brtt-${{ matrix.target }}.exe
-            fi
+            mv target/${{ matrix.target }}/release/brtt.exe target/${{ matrix.target }}/release/brtt-${{ matrix.target }}.exe
           else
-            if [[ "${{ matrix.suffix }}" != "" ]]; then
-              mv target/${{ matrix.target }}/release/brtt target/${{ matrix.target }}/release/brtt-${{ matrix.target }}-${{ matrix.suffix }}
-            else
-              mv target/${{ matrix.target }}/release/brtt target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
-            fi
+            mv target/${{ matrix.target }}/release/brtt target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
           fi
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: brtt-${{ matrix.target }}${{ matrix.suffix != '' && format('-{0}', matrix.suffix) || '' }}
+          name: brtt-${{ matrix.target }}
           path: |
-            target/${{ matrix.target }}/release/brtt-${{ matrix.target }}${{ matrix.suffix != '' && format('-{0}', matrix.suffix) || '' }}
-            target/${{ matrix.target }}/release/brtt-${{ matrix.target }}${{ matrix.suffix != '' && format('-{0}', matrix.suffix) || '' }}.exe
+            target/${{ matrix.target }}/release/brtt-${{ matrix.target }}
+            target/${{ matrix.target }}/release/brtt-${{ matrix.target }}.exe
 
   release:
     runs-on: ubuntu-latest
