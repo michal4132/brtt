@@ -20,3 +20,10 @@ tracing = "0.1"
 docsplay = "0.1.1"
 thiserror = "2.0.11"
 parking_lot = "0.12.2"
+
+[profile.release]
+opt-level = "z"       # Optimize for size
+lto = true             # Full link-time optimization
+codegen-units = 1      # Single codegen unit for max optimization
+panic = "abort"        # Smaller binary, no unwinding
+strip = true           # Strip symbols and debug info
