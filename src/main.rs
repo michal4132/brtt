@@ -1,8 +1,5 @@
-mod rtt;
-mod channel;
-
-use rtt::{Rtt, ScanRegion};
-use channel::{ChannelMode, RttChannel, UpChannel, DownChannel};
+use brtt::rtt::{Rtt, ScanRegion};
+use brtt::channel::{RttChannel, UpChannel, DownChannel};
 
 use probe_rs::{Permissions, probe::list::Lister};
 use probe_rs::{config::TargetSelector, probe::DebugProbeInfo};
