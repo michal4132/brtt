@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -33,7 +33,6 @@ impl ChannelMode {
     pub(crate) fn name(self) -> &'static str {
         match self {
             ChannelMode::Ascii => "ascii",
-
             ChannelMode::Defmt => "defmt",
         }
     }
@@ -45,7 +44,6 @@ impl std::str::FromStr for ChannelMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "ascii" => Ok(ChannelMode::Ascii),
-
             "defmt" => Ok(ChannelMode::Defmt),
             _ => Err(format!(
                 "invalid channel mode '{value}', expected ascii or defmt"
@@ -150,11 +148,10 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
-        action = clap::ArgAction::Append,
-        value_name = "CHANNEL[:MODE]",
+        value_name = "CHANNEL",
         help = "Down channel specification. Only one channel is supported; defaults to channel 0."
     )]
-    pub(crate) down: Vec<ChannelSpec>,
+    pub(crate) down: Option<u32>,
 
     #[clap(short, long, help = "Reset the target after RTT session was opened")]
     pub(crate) reset: bool,
@@ -239,15 +236,7 @@ impl Opts {
             }
         }
 
-        if self.down.len() > 1 {
-            bail!("multiple down channels are not supported; specify only one");
-        }
-        if let Some(spec) = self.down.first() {
-            if spec.mode != ChannelMode::Ascii {
-                bail!("down channel {} only supports the ascii mode", spec.index);
-            }
-        }
-        if self.no_down && !self.down.is_empty() {
+        if self.no_down && self.down.is_some() {
             bail!("--no-down cannot be combined with --down");
         }
 
@@ -281,7 +270,7 @@ impl Opts {
 
         let session_options = || {
             !self.up.is_empty()
-                || !self.down.is_empty()
+                || self.down.is_some()
                 || self.no_down
                 || self.reset
                 || self.log.is_some()
@@ -299,7 +288,7 @@ impl Opts {
             }
             if session_options()
                 && (!self.up.is_empty()
-                    || !self.down.is_empty()
+                    || self.down.is_some()
                     || self.no_down
                     || self.reset
                     || self.log.is_some()
@@ -319,7 +308,7 @@ impl Opts {
                 bail!("--list cannot be combined with --probe list");
             }
             if !self.up.is_empty()
-                || !self.down.is_empty()
+                || self.down.is_some()
                 || self.no_down
                 || self.reset
                 || self.log.is_some()
@@ -338,7 +327,7 @@ impl Opts {
         if matches!(self.probe, ProbeInfo::List)
             && (self.list
                 || !self.up.is_empty()
-                || !self.down.is_empty()
+                || self.down.is_some()
                 || self.no_down
                 || self.reset
                 || self.log.is_some()
@@ -399,23 +388,6 @@ fn crate_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser::Level)>> {
     Ok(result)
 }
 
-pub(crate) fn selected_channel(specs: &[ChannelSpec], direction: &str) -> Result<usize> {
-    let spec = match specs {
-        [] => return Ok(0),
-        [spec] => spec,
-        _ => bail!(
-            "Multiple {direction} channels are not supported yet; use only one specification."
-        ),
-    };
-
-    usize::try_from(spec.index).with_context(|| {
-        format!(
-            "{direction} channel index {} cannot be represented on this host",
-            spec.index
-        )
-    })
-}
-
 pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     if specs.is_empty() {
         vec![ChannelSpec {
@@ -433,7 +405,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn channel_spec_defaults_to_raw() {
+    fn channel_spec_defaults_to_ascii() {
         assert_eq!(
             "7".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
@@ -456,7 +428,7 @@ mod tests {
             "2:ascii".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 2,
-                mode: ChannelMode::Ascii,
+                mode: ChannelMode::Ascii
             })
         );
         assert_eq!(
@@ -491,10 +463,7 @@ mod tests {
 
     #[test]
     fn opts_accept_repeated_channel_specs_in_order() {
-        let opts = Opts::try_parse_from([
-            "brtt", "-u", "3:ascii", "--up", "4", "-d", "1:defmt", "--down", "2:ascii",
-        ])
-        .unwrap();
+        let opts = Opts::try_parse_from(["brtt", "-u", "3:ascii", "--up", "4", "-d", "2"]).unwrap();
 
         assert_eq!(
             opts.up,
@@ -509,19 +478,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            opts.down,
-            vec![
-                ChannelSpec {
-                    index: 1,
-                    mode: ChannelMode::Defmt,
-                },
-                ChannelSpec {
-                    index: 2,
-                    mode: ChannelMode::Ascii,
-                },
-            ]
-        );
+        assert_eq!(opts.down, Some(2));
     }
 
     #[test]
@@ -529,7 +486,7 @@ mod tests {
         let opts = Opts::try_parse_from(["brtt"]).unwrap();
 
         assert!(opts.up.is_empty());
-        assert!(opts.down.is_empty());
+        assert!(opts.down.is_none());
     }
 
     fn validate_args(args: &[&str]) -> std::result::Result<(), String> {
@@ -541,8 +498,6 @@ mod tests {
     #[test]
     fn validation_rejects_unsupported_channel_combinations() {
         assert!(validate_args(&["brtt", "--up", "0", "--up", "0"]).is_err());
-        assert!(validate_args(&["brtt", "--down", "0:ascii"]).is_err());
-        assert!(validate_args(&["brtt", "--down", "0:defmt"]).is_err());
         assert!(validate_args(&["brtt", "--poll-interval", "0"]).is_err());
         assert!(validate_args(&["brtt", "--up", "1:defmt"]).is_err());
         assert!(validate_args(&["brtt", "--defmt-filter", "warn"]).is_err());
@@ -613,35 +568,5 @@ mod tests {
         ];
 
         assert_eq!(configured_up_specs(&specs), specs);
-    }
-
-    #[test]
-    fn selected_channel_preserves_default_and_rejects_multiple_channels() {
-        assert_eq!(selected_channel(&[], "up").unwrap(), 0);
-        assert_eq!(
-            selected_channel(
-                &[ChannelSpec {
-                    index: 4,
-                    mode: ChannelMode::Ascii,
-                }],
-                "up",
-            )
-            .unwrap(),
-            4
-        );
-        assert!(selected_channel(
-            &[
-                ChannelSpec {
-                    index: 1,
-                    mode: ChannelMode::Ascii,
-                },
-                ChannelSpec {
-                    index: 2,
-                    mode: ChannelMode::Ascii,
-                },
-            ],
-            "down",
-        )
-        .is_err());
     }
 }

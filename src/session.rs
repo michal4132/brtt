@@ -237,7 +237,7 @@ fn poll_up_channels(
                 logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
             }
             match reader.spec.mode {
-                ChannelMode::Ascii | ChannelMode::Ascii => events.push(ChannelEvent {
+                ChannelMode::Ascii => events.push(ChannelEvent {
                     channel_idx: reader.spec.index,
                     payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
                     timestamp,

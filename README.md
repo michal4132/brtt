@@ -13,8 +13,8 @@ brtt [OPTIONS]
 - `-p, --probe <PROBE>`: Specify the probe number. Use `list` to see all available probes. [default: 0]
 - `-c, --chip <CHIP>`: Specify the target chip type (e.g., `nRF52840_xxAA`). If not provided, `brtt` will attempt to auto-detect it.
 - `-l, --list`: List available RTT up and down channels on the target and exit.
-- `-u, --up <CHANNEL[:MODE]>`: The RTT "up" channel (target to host) to use. `MODE` can be `raw`, `text`, or `defmt` and defaults to `raw`. Defaults to channel 0 and may be repeated.
-- `-d, --down <CHANNEL[:MODE]>`: The RTT "down" channel (host to target) for keyboard input. Only one raw channel is supported and it defaults to channel 0.
+- `-u, --up <CHANNEL[:MODE]>`: The RTT "up" channel (target to host) to use. `MODE` can be `ascii` or `defmt` and defaults to `ascii`. Defaults to channel 0 and may be repeated.
+- `-d, --down <CHANNEL>`: The RTT "down" channel (host to target) for keyboard input. Only one channel is supported and it defaults to channel 0.
 - `--no-down`: Disable the default down channel and keyboard input for output-only sessions.
 - `-r, --reset`: Reset the target after opening the RTT session.
 - `--poll-interval <MILLISECONDS>`: Polling interval for RTT and keyboard input. [default: 10]

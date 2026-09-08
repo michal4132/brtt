@@ -8,7 +8,7 @@ use brtt::rtt::Rtt;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cli::{configured_up_specs, selected_channel, ChannelMode, Opts, ProbeInfo};
+use cli::{configured_up_specs, ChannelMode, Opts, ProbeInfo};
 use probe_rs::{config::TargetSelector, probe::list::Lister, probe::DebugProbeInfo, Permissions};
 use session::{run_session, SessionConfig};
 use std::time::Duration;
@@ -26,8 +26,7 @@ fn main() -> Result<()> {
         .transpose()?;
     let defmt_data = defmt::require_elf(
         opts.elf.as_deref(),
-        opts.debug_defmt_table
-            || up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
+        opts.debug_defmt_table || up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
     )?;
     if opts.debug_defmt_table {
         let data = defmt_data.as_ref().ok_or_else(|| {
@@ -113,7 +112,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let down_channel = selected_channel(&opts.down, "down")?;
+    let down_channel = opts
+        .down
+        .unwrap_or(0)
+        .try_into()
+        .context("down channel index cannot be represented on this host")?;
 
     run_session(
         &mut core,
