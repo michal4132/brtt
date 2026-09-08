@@ -2,7 +2,10 @@ use crate::cli::{ChannelMode, ChannelSpec};
 use anyhow::{bail, Context, Result};
 use brtt::rtt::Rtt;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal;
+use crossterm::{
+    cursor, execute,
+    terminal::{self, ClearType},
+};
 use probe_rs::Core;
 use std::io::prelude::*;
 use std::io::stdout;
@@ -30,6 +33,24 @@ impl UpChannelReader {
     }
 }
 
+struct SessionState {
+    timestamps: bool,
+    local_echo: bool,
+    line_start: bool,
+    started: Instant,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            timestamps: false,
+            local_echo: false,
+            line_start: true,
+            started: Instant::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeState {
     Normal,
@@ -40,6 +61,11 @@ enum EscapeState {
 enum SessionCommand {
     Quit,
     Help,
+    ShowConfig,
+    ClearScreen,
+    ToggleTimestamps,
+    ToggleLocalEcho,
+    ResetTarget,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -80,6 +106,26 @@ impl EscapeState {
                     KeyCode::Char('?') => (
                         EscapeState::Normal,
                         InputAction::Command(SessionCommand::Help),
+                    ),
+                    KeyCode::Char('c') if key.modifiers.is_empty() => (
+                        EscapeState::Normal,
+                        InputAction::Command(SessionCommand::ShowConfig),
+                    ),
+                    KeyCode::Char('l') if key.modifiers.is_empty() => (
+                        EscapeState::Normal,
+                        InputAction::Command(SessionCommand::ClearScreen),
+                    ),
+                    KeyCode::Char('t') if key.modifiers.is_empty() => (
+                        EscapeState::Normal,
+                        InputAction::Command(SessionCommand::ToggleTimestamps),
+                    ),
+                    KeyCode::Char('e') if key.modifiers.is_empty() => (
+                        EscapeState::Normal,
+                        InputAction::Command(SessionCommand::ToggleLocalEcho),
+                    ),
+                    KeyCode::Char('R') => (
+                        EscapeState::Normal,
+                        InputAction::Command(SessionCommand::ResetTarget),
                     ),
                     _ => (EscapeState::Normal, key_to_action(key)),
                 }
@@ -178,16 +224,40 @@ fn poll_up_channels(
     Ok(events)
 }
 
-fn render_events(events: &[ChannelEvent], output: &mut impl Write) -> std::io::Result<()> {
+fn render_bytes(
+    bytes: &[u8],
+    timestamp: Instant,
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    for &byte in bytes {
+        if state.timestamps && state.line_start {
+            let elapsed = timestamp.saturating_duration_since(state.started);
+            write!(output, "[+{:>8.3}s] ", elapsed.as_secs_f64())?;
+            state.line_start = false;
+        }
+
+        if byte == b'\n' {
+            output.write_all(b"\r")?;
+            state.line_start = true;
+        } else {
+            state.line_start = false;
+        }
+        output.write_all(&[byte])?;
+    }
+
+    Ok(())
+}
+
+fn render_events(
+    events: &[ChannelEvent],
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
     for event in events {
         match event.mode {
             ChannelMode::Ascii | ChannelMode::Ascii => {
-                for &byte in &event.bytes {
-                    if byte == b'\n' {
-                        output.write_all(b"\r")?;
-                    }
-                    output.write_all(&[byte])?;
-                }
+                render_bytes(&event.bytes, event.timestamp, state, output)?;
             }
             ChannelMode::Defmt => unreachable!(
                 "defmt event from channel {} was not rejected before polling",
@@ -203,16 +273,120 @@ fn write_help(output: &mut impl Write) -> std::io::Result<()> {
     writeln!(output, "\r\nCtrl-T commands:")?;
     writeln!(output, "  q  Quit")?;
     writeln!(output, "  ?  Show this help")?;
+    writeln!(output, "  c  Show configuration")?;
+    writeln!(output, "  l  Clear screen")?;
+    writeln!(output, "  t  Toggle timestamps")?;
+    writeln!(output, "  e  Toggle local echo")?;
+    writeln!(output, "  R  Reset target")?;
     writeln!(output, "  Ctrl-T  Send a literal Ctrl-T")?;
     output.flush()
 }
 
+fn write_config(
+    config: &SessionConfig,
+    state: &SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    writeln!(output, "\r\nConfiguration:")?;
+    writeln!(output, "  Probe: {}", config.probe)?;
+    writeln!(output, "  Chip: {}", config.chip)?;
+    write!(output, "  Up channels:")?;
+    for spec in &config.up_specs {
+        write!(output, " {}:{}", spec.index, spec.mode.name())?;
+    }
+    writeln!(output)?;
+    writeln!(output, "  Down channel: {}", config.down_channel)?;
+    writeln!(
+        output,
+        "  Poll interval: {} ms",
+        config.poll_interval.as_millis()
+    )?;
+    writeln!(output, "  Timestamps: {}", on_or_off(state.timestamps))?;
+    writeln!(output, "  Local echo: {}", on_or_off(state.local_echo))?;
+    output.flush()
+}
+
+fn clear_screen(output: &mut impl Write) -> std::io::Result<()> {
+    execute!(
+        output,
+        terminal::Clear(ClearType::All),
+        cursor::MoveTo(0, 0)
+    )?;
+    output.flush()
+}
+
+fn on_or_off(enabled: bool) -> &'static str {
+    if enabled {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn dispatch_command(
+    command: SessionCommand,
+    core: &mut Core,
+    rtt: &mut Rtt,
+    config: &SessionConfig,
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> Result<bool> {
+    match command {
+        SessionCommand::Quit => return Ok(true),
+        SessionCommand::Help => {
+            write_help(output)?;
+            state.line_start = true;
+        }
+        SessionCommand::ShowConfig => {
+            write_config(config, state, output)?;
+            state.line_start = true;
+        }
+        SessionCommand::ClearScreen => {
+            clear_screen(output)?;
+            state.line_start = true;
+        }
+        SessionCommand::ToggleTimestamps => {
+            state.timestamps = !state.timestamps;
+            writeln!(output, "\r\nTimestamps: {}", on_or_off(state.timestamps))?;
+            output.flush()?;
+            state.line_start = true;
+        }
+        SessionCommand::ToggleLocalEcho => {
+            state.local_echo = !state.local_echo;
+            writeln!(output, "\r\nLocal echo: {}", on_or_off(state.local_echo))?;
+            output.flush()?;
+            state.line_start = true;
+        }
+        SessionCommand::ResetTarget => {
+            core.reset().context("Error resetting target")?;
+            // The target reset may rewind RTT pointers while the host retains old read state.
+            rtt.reset_read_state();
+            writeln!(output, "\r\nTarget reset.")?;
+            output.flush()?;
+            state.line_start = true;
+        }
+    }
+
+    Ok(false)
+}
+
 pub(crate) struct SessionConfig {
+    pub(crate) probe: String,
+    pub(crate) chip: String,
     pub(crate) up_specs: Vec<ChannelSpec>,
     pub(crate) up_configured: bool,
     pub(crate) down_channel: usize,
     pub(crate) down_configured: bool,
+    pub(crate) poll_interval: Duration,
     pub(crate) reset: bool,
+}
+
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> {
@@ -221,7 +395,8 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     }
     let mut up_readers = config
         .up_specs
-        .into_iter()
+        .iter()
+        .copied()
         .map(UpChannelReader::new)
         .collect::<Vec<_>>();
 
@@ -238,11 +413,15 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
+    let mut state = SessionState::new();
     let stdin_setup = rtt.down_channel(config.down_channel).is_some();
 
-    if stdin_setup {
+    let _raw_mode = if stdin_setup {
         terminal::enable_raw_mode()?;
-    }
+        Some(RawModeGuard)
+    } else {
+        None
+    };
 
     let mut output = stdout();
     let result = 'read_loop: loop {
@@ -254,29 +433,48 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         };
 
         if !events.is_empty() {
-            if let Err(err) = render_events(&events, &mut output) {
+            if let Err(err) = render_events(&events, &mut state, &mut output) {
                 break 'read_loop Err(anyhow::anyhow!("Error writing to stdout: {err}"));
             }
         }
 
-        if stdin_setup && event::poll(Duration::from_millis(0))? {
+        if stdin_setup && event::poll(config.poll_interval)? {
             if let Event::Key(key_event) = event::read()? {
                 let (next_state, action) = escape_state.handle_key(key_event);
                 escape_state = next_state;
 
                 match action {
-                    InputAction::Send(bytes) => down_buf.extend_from_slice(&bytes),
-                    InputAction::Command(SessionCommand::Help) => {
-                        if let Err(err) = write_help(&mut output) {
-                            break 'read_loop Err(anyhow::anyhow!(
-                                "Error writing command help: {err}"
-                            ));
+                    InputAction::Send(bytes) => {
+                        if state.local_echo {
+                            if let Err(err) =
+                                render_bytes(&bytes, Instant::now(), &mut state, &mut output)
+                            {
+                                break 'read_loop Err(anyhow::anyhow!(
+                                    "Error writing local echo: {err}"
+                                ));
+                            }
+                        }
+                        down_buf.extend_from_slice(&bytes);
+                    }
+                    InputAction::Command(command) => {
+                        match dispatch_command(
+                            command,
+                            core,
+                            &mut rtt,
+                            &config,
+                            &mut state,
+                            &mut output,
+                        ) {
+                            Ok(true) => break 'read_loop Ok(()),
+                            Ok(false) => {}
+                            Err(err) => break 'read_loop Err(err),
                         }
                     }
-                    InputAction::Command(SessionCommand::Quit) => break 'read_loop Ok(()),
                     InputAction::Ignore => {}
                 }
             }
+        } else if !stdin_setup {
+            std::thread::sleep(config.poll_interval);
         }
 
         if let Some(down_channel) = rtt.down_channel(config.down_channel) {
@@ -294,10 +492,6 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
             }
         }
     };
-
-    if stdin_setup {
-        terminal::disable_raw_mode()?;
-    }
 
     result
 }
@@ -341,6 +535,30 @@ mod tests {
 
         assert_eq!(state, EscapeState::Normal);
         assert_eq!(action, InputAction::Command(SessionCommand::Help));
+    }
+
+    #[test]
+    fn ctrl_t_core_commands_dispatch_to_their_commands() {
+        for (character, command) in [
+            ('c', SessionCommand::ShowConfig),
+            ('l', SessionCommand::ClearScreen),
+            ('t', SessionCommand::ToggleTimestamps),
+            ('e', SessionCommand::ToggleLocalEcho),
+        ] {
+            assert_eq!(
+                EscapeState::AwaitingCommand
+                    .handle_key(key(KeyCode::Char(character), KeyModifiers::NONE)),
+                (EscapeState::Normal, InputAction::Command(command))
+            );
+        }
+
+        assert_eq!(
+            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+            (
+                EscapeState::Normal,
+                InputAction::Command(SessionCommand::ResetTarget)
+            )
+        );
     }
 
     #[test]
@@ -396,6 +614,65 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("q  Quit"));
         assert!(output.contains("?  Show this help"));
+        assert!(output.contains("c  Show configuration"));
+        assert!(output.contains("l  Clear screen"));
+        assert!(output.contains("t  Toggle timestamps"));
+        assert!(output.contains("e  Toggle local echo"));
+        assert!(output.contains("R  Reset target"));
+    }
+
+    #[test]
+    fn timestamps_are_added_once_per_line_across_partial_events() {
+        let mut state = SessionState::new();
+        state.timestamps = true;
+        let timestamp = state.started + Duration::from_millis(123);
+        let mut output = Vec::new();
+
+        render_bytes(b"partial", timestamp, &mut state, &mut output).unwrap();
+        render_bytes(b" line\nnext", timestamp, &mut state, &mut output).unwrap();
+
+        assert_eq!(output, b"[+   0.123s] partial line\r\n[+   0.123s] next");
+    }
+
+    #[test]
+    fn timestamps_are_disabled_by_default() {
+        let mut state = SessionState::new();
+        let mut output = Vec::new();
+
+        render_bytes(b"text\n", Instant::now(), &mut state, &mut output).unwrap();
+
+        assert_eq!(output, b"text\r\n");
+    }
+
+    #[test]
+    fn config_and_clear_screen_outputs_include_session_settings() {
+        let config = SessionConfig {
+            probe: "probe-id".to_string(),
+            chip: "nRF52840_xxAA".to_string(),
+            up_specs: vec![ChannelSpec {
+                index: 2,
+                mode: ChannelMode::Ascii,
+            }],
+            up_configured: true,
+            down_channel: 1,
+            down_configured: true,
+            poll_interval: Duration::from_millis(10),
+            reset: false,
+        };
+        let state = SessionState::new();
+        let mut output = Vec::new();
+
+        write_config(&config, &state, &mut output).unwrap();
+        let config_output = String::from_utf8(output).unwrap();
+        assert!(config_output.contains("Probe: probe-id"));
+        assert!(config_output.contains("Chip: nRF52840_xxAA"));
+        assert!(config_output.contains("Up channels: 2:ascii"));
+        assert!(config_output.contains("Down channel: 1"));
+        assert!(config_output.contains("Poll interval: 10 ms"));
+
+        let mut clear_output = Vec::new();
+        clear_screen(&mut clear_output).unwrap();
+        assert!(clear_output.starts_with(b"\x1b[2J"));
     }
 
     #[test]
@@ -415,8 +692,9 @@ mod tests {
             },
         ];
         let mut output = Vec::new();
+        let mut state = SessionState::new();
 
-        render_events(&events, &mut output).unwrap();
+        render_events(&events, &mut state, &mut output).unwrap();
 
         assert_eq!(events[0].channel_idx, 2);
         assert_eq!(events[1].channel_idx, 0);

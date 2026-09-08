@@ -27,6 +27,16 @@ pub(crate) enum ChannelMode {
     Defmt,
 }
 
+impl ChannelMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ChannelMode::Ascii => "ascii",
+
+            ChannelMode::Defmt => "defmt",
+        }
+    }
+}
+
 impl std::str::FromStr for ChannelMode {
     type Err = String;
 
@@ -146,6 +156,14 @@ pub(crate) struct Opts {
 
     #[clap(short, long, help = "Reset the target after RTT session was opened")]
     pub(crate) reset: bool,
+
+    #[clap(
+        long,
+        default_value = "10",
+        value_name = "MILLISECONDS",
+        help = "Polling interval for RTT and keyboard input."
+    )]
+    pub(crate) poll_interval: u64,
 
     #[clap(
         long,

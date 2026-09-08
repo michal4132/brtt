@@ -431,6 +431,13 @@ impl Rtt {
             .find(|candidate| candidate.number() == channel)
     }
 
+    /// Clears host-side up-channel read state after the target has been reset.
+    pub fn reset_read_state(&mut self) {
+        for channel in &mut self.up_channels {
+            channel.reset_read_state();
+        }
+    }
+
     /// Returns the size of the RTT control block.
     pub fn control_block_size(core: &Core) -> usize {
         let is_64_bit = core.is_64_bit();

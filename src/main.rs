@@ -9,6 +9,7 @@ use clap::Parser;
 use cli::{configured_up_specs, selected_channel, Opts, ProbeInfo};
 use probe_rs::{config::TargetSelector, probe::list::Lister, probe::DebugProbeInfo, Permissions};
 use session::{run_session, SessionConfig};
+use std::time::Duration;
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -36,6 +37,14 @@ fn main() -> Result<()> {
         bail!("Probe {probe_number} does not exist.");
     }
 
+    let probe_label = format!(
+        "{} {}",
+        probes[probe_number].identifier,
+        probes[probe_number]
+            .serial_number
+            .as_deref()
+            .unwrap_or("(no serial number)")
+    );
     let probe = match probes[probe_number].open() {
         Ok(probe) => probe,
         Err(err) => {
@@ -44,6 +53,7 @@ fn main() -> Result<()> {
     };
 
     let target_selector = TargetSelector::from(opts.chip.as_deref());
+    let chip = opts.chip.as_deref().unwrap_or("auto").to_string();
 
     let mut session = match probe.attach(target_selector, Permissions::default()) {
         Ok(session) => session,
@@ -86,10 +96,13 @@ fn main() -> Result<()> {
         &mut core,
         rtt,
         SessionConfig {
+            probe: probe_label,
+            chip,
             up_specs,
             up_configured: !opts.up.is_empty(),
             down_channel,
             down_configured: !opts.down.is_empty(),
+            poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
         },
     )
