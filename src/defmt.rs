@@ -20,27 +20,37 @@ pub(crate) struct DecodedFrame {
     pub(crate) line: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum DecodeOutput {
+    Frame(DecodedFrame),
+    Warning(String),
+}
+
 pub(crate) fn decode_frames(
     decoder: &mut dyn defmt_decoder::StreamDecoder,
     bytes: &[u8],
     locations: Option<&Locations>,
-) -> Result<Vec<DecodedFrame>, defmt_decoder::DecodeError> {
+    can_recover: bool,
+) -> Result<Vec<DecodeOutput>, defmt_decoder::DecodeError> {
     decoder.received(bytes);
     let mut frames = Vec::new();
     loop {
         match decoder.decode() {
             Ok(frame) => {
                 let location = locations.and_then(|locations| locations.get(&frame.index()));
-                frames.push(DecodedFrame {
+                frames.push(DecodeOutput::Frame(DecodedFrame {
                     message: frame.display_message().to_string(),
                     timestamp: frame.display_timestamp().map(|timestamp| timestamp.to_string()),
                     level: frame.level(),
                     module: location.map(|location| location.module.clone()),
                     file: location.map(|location| location.file.clone()),
                     line: location.map(|location| location.line),
-                });
+                }));
             }
             Err(defmt_decoder::DecodeError::UnexpectedEof) => return Ok(frames),
+            Err(error) if can_recover => {
+                frames.push(DecodeOutput::Warning(format!("defmt decode warning: {error}")));
+            }
             Err(error) => return Err(error),
         }
     }

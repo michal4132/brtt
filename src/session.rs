@@ -1,5 +1,5 @@
 use crate::cli::{ChannelMode, ChannelSpec};
-use crate::defmt::{decode_frames, level_name, DecodedFrame, DefmtData};
+use crate::defmt::{decode_frames, level_name, DecodeOutput, DecodedFrame, DefmtData};
 use anyhow::{bail, Context, Result};
 use brtt::rtt::Rtt;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -23,12 +23,14 @@ struct ChannelEvent {
 enum ChannelPayload {
     Bytes(Vec<u8>),
     Defmt(DecodedFrame),
+    Warning(String),
 }
 
 struct UpChannelReader<'table> {
     spec: ChannelSpec,
     buffer: [u8; 128],
     decoder: Option<Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>>,
+    defmt_can_recover: bool,
 }
 
 impl<'table> UpChannelReader<'table> {
@@ -42,6 +44,7 @@ impl<'table> UpChannelReader<'table> {
             spec,
             buffer: [0; 128],
             decoder,
+            defmt_can_recover: defmt.is_some_and(|defmt| defmt.table.encoding().can_recover()),
         })
     }
 }
@@ -51,6 +54,8 @@ struct SessionState {
     local_echo: bool,
     line_start: bool,
     started: Instant,
+    defmt_decode_warnings: u64,
+    color: bool,
 }
 
 impl SessionState {
@@ -60,6 +65,8 @@ impl SessionState {
             local_echo: false,
             line_start: true,
             started: Instant::now(),
+            defmt_decode_warnings: 0,
+            color: false,
         }
     }
 }
@@ -230,11 +237,15 @@ fn poll_up_channels(
                         &mut **reader.decoder.as_mut().expect("defmt decoder initialized"),
                         &reader.buffer[..count],
                         locations,
+                        reader.defmt_can_recover,
                     )
                     .with_context(|| format!("failed to decode defmt on up channel {}", reader.spec.index))?;
-                    events.extend(frames.into_iter().map(|frame| ChannelEvent {
+                    events.extend(frames.into_iter().map(|output| ChannelEvent {
                         channel_idx: reader.spec.index,
-                        payload: ChannelPayload::Defmt(frame),
+                        payload: match output {
+                            DecodeOutput::Frame(frame) => ChannelPayload::Defmt(frame),
+                            DecodeOutput::Warning(warning) => ChannelPayload::Warning(warning),
+                        },
                         timestamp,
                     }));
                 }
@@ -292,7 +303,25 @@ fn render_events(
                 }
                 line.push_str(&frame.message);
                 line.push('\n');
+                if state.color {
+                    let color = match frame.level {
+                        Some(defmt_parser::Level::Error) => "\x1b[31m",
+                        Some(defmt_parser::Level::Warn) => "\x1b[33m",
+                        Some(defmt_parser::Level::Debug | defmt_parser::Level::Trace) => "\x1b[2m",
+                        _ => "",
+                    };
+                    if !color.is_empty() {
+                        output.write_all(color.as_bytes())?;
+                        output.write_all(line.as_bytes())?;
+                        output.write_all(b"\x1b[0m")?;
+                        continue;
+                    }
+                }
                 render_bytes(line.as_bytes(), event.timestamp, state, output)?;
+            }
+            ChannelPayload::Warning(warning) => {
+                state.defmt_decode_warnings += 1;
+                render_bytes(format!("[defmt warning #{}] {warning}\n", state.defmt_decode_warnings).as_bytes(), event.timestamp, state, output)?;
             }
         }
     }
@@ -449,6 +478,11 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
     let mut state = SessionState::new();
+    state.color = match config.color {
+        crate::cli::ColorMode::Always => true,
+        crate::cli::ColorMode::Never => false,
+        crate::cli::ColorMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
     let stdin_setup = rtt.down_channel(config.down_channel).is_some();
 
     let _raw_mode = if stdin_setup {
