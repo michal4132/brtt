@@ -19,7 +19,7 @@
 //! // First obtain a probe-rs session (see probe-rs documentation for details)
 //! let lister = Lister::new();
 //!
-//! let probes = lister.list_all().await;
+//! let probes = lister.list_all();
 //!
 //! let probe = probes[0].open()?;
 //! let mut session = probe.attach("somechip", Permissions::default())?;
@@ -419,12 +419,16 @@ impl Rtt {
 
     /// Returns a particular up channel.
     pub fn up_channel(&mut self, channel: usize) -> Option<&mut UpChannel> {
-        self.up_channels.get_mut(channel)
+        self.up_channels
+            .iter_mut()
+            .find(|candidate| candidate.number() == channel)
     }
 
     /// Returns a particular down channel.
     pub fn down_channel(&mut self, channel: usize) -> Option<&mut DownChannel> {
-        self.down_channels.get_mut(channel)
+        self.down_channels
+            .iter_mut()
+            .find(|candidate| candidate.number() == channel)
     }
 
     /// Returns the size of the RTT control block.
