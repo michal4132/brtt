@@ -1,5 +1,6 @@
 mod cli;
 mod defmt;
+mod logger;
 mod session;
 
 use brtt::channel::RttChannel;
@@ -126,6 +127,9 @@ fn main() -> Result<()> {
             defmt: defmt_data,
             defmt_filters,
             color: opts.color,
+            log: opts.log,
+            log_per_channel: opts.log_per_channel,
+            log_format: opts.log_format,
         },
     )
 }

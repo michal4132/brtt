@@ -189,6 +189,20 @@ pub(crate) struct Opts {
 
     #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
     pub(crate) color: ColorMode,
+
+    #[clap(
+        short = 'L',
+        long,
+        value_name = "PATH",
+        help = "Write session output to a log file."
+    )]
+    pub(crate) log: Option<PathBuf>,
+
+    #[clap(long, help = "Write one log file per up channel.")]
+    pub(crate) log_per_channel: bool,
+
+    #[clap(long, value_enum, default_value_t = LogFormat::Decoded, help = "Log raw bytes or decoded text.")]
+    pub(crate) log_format: LogFormat,
 }
 
 #[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +210,12 @@ pub(crate) enum ColorMode {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogFormat {
+    Raw,
+    Decoded,
 }
 
 pub(crate) fn selected_channel(specs: &[ChannelSpec], direction: &str) -> Result<usize> {

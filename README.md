@@ -22,6 +22,11 @@ brtt [OPTIONS]
 - `--debug-defmt-table`: Print defmt table metadata and exit.
 - `--defmt-filter <SPEC>`: Filter defmt output, for example `warn` or `app=debug,warn`.
 - `--color <auto|always|never>`: Select defmt level coloring.
+- `-L, --log <PATH>`: Write session output to a log file.
+- `--log-per-channel`: Write separate `.chN` files instead of one merged log.
+- `--log-format <decoded|raw>`: Log decoded text or exact RTT bytes. Raw merged logs require a single up channel.
+
+When multiple up channels are selected, terminal output is prefixed with `[chN]`. Channel prefixes use a stable automatic color palette when color output is enabled. Log files never contain ANSI color escapes.
 
 During a session, press `Ctrl-T` followed by a command key:
 
