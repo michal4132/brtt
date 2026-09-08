@@ -169,7 +169,9 @@ mod tests {
     #[test]
     fn per_channel_raw_logs_preserve_bytes() {
         let path = test_path("raw-per-channel.log");
-        let mut logger = Logger::new(Some(&path), true, LogFormat::Raw, 2).unwrap().unwrap();
+        let mut logger = Logger::new(Some(&path), true, LogFormat::Raw, 2)
+            .unwrap()
+            .unwrap();
         logger.write_raw(1, &[0, 1, 0xff]).unwrap();
         logger.flush().unwrap();
         let channel_path = channel_path(&path, 1);

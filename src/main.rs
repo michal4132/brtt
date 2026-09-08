@@ -18,6 +18,7 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
 
     let up_specs = configured_up_specs(&opts.up);
+    opts.validate(&up_specs)?;
     let defmt_filters = opts
         .defmt_filter
         .as_deref()
@@ -39,6 +40,11 @@ fn main() -> Result<()> {
     let lister = Lister::new();
     let probes = lister.list_all();
 
+    if matches!(opts.probe, ProbeInfo::List) {
+        list_probes(std::io::stdout(), &probes);
+        return Ok(());
+    }
+
     if probes.is_empty() {
         bail!(
             "No debug probes available. Make sure your probe is plugged in, supported and up-to-date."
@@ -46,11 +52,8 @@ fn main() -> Result<()> {
     }
 
     let probe_number = match opts.probe {
-        ProbeInfo::List => {
-            list_probes(std::io::stdout(), &probes);
-            return Ok(());
-        }
         ProbeInfo::Number(i) => i,
+        ProbeInfo::List => unreachable!("probe list handled above"),
     };
 
     if probe_number >= probes.len() {
@@ -119,9 +122,9 @@ fn main() -> Result<()> {
             probe: probe_label,
             chip,
             up_specs,
-            up_configured: !opts.up.is_empty(),
+            up_configured: true,
             down_channel,
-            down_configured: !opts.down.is_empty(),
+            down_configured: !opts.no_down,
             poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
             defmt: defmt_data,
@@ -129,7 +132,7 @@ fn main() -> Result<()> {
             color: opts.color,
             log: opts.log,
             log_per_channel: opts.log_per_channel,
-            log_format: opts.log_format,
+            log_format: opts.log_format.unwrap_or(cli::LogFormat::Decoded),
         },
     )
 }

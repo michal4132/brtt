@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 struct ChannelEvent {
     channel_idx: u32,
-    raw: Option<Vec<u8>>,
     payload: ChannelPayload,
     timestamp: Instant,
 }
@@ -28,7 +27,6 @@ enum ChannelPayload {
     Bytes(Vec<u8>),
     Defmt(DecodedFrame),
     Warning(String),
-    Pending,
 }
 
 struct UpChannelReader<'table> {
@@ -215,7 +213,9 @@ fn poll_up_channels(
     core: &mut Core,
     readers: &mut [UpChannelReader<'_>],
     locations: Option<&defmt_decoder::Locations>,
+    logger: Option<&mut Logger>,
 ) -> Result<Vec<ChannelEvent>> {
+    let mut logger = logger;
     let mut events = Vec::with_capacity(readers.len());
 
     for reader in readers {
@@ -233,10 +233,12 @@ fn poll_up_channels(
 
         if count > 0 {
             let timestamp = Instant::now();
+            if let Some(logger) = logger.as_deref_mut() {
+                logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
+            }
             match reader.spec.mode {
                 ChannelMode::Ascii | ChannelMode::Ascii => events.push(ChannelEvent {
                     channel_idx: reader.spec.index,
-                    raw: Some(reader.buffer[..count].to_vec()),
                     payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
                     timestamp,
                 }),
@@ -250,28 +252,14 @@ fn poll_up_channels(
                     .with_context(|| {
                         format!("failed to decode defmt on up channel {}", reader.spec.index)
                     })?;
-                    if frames.is_empty() {
-                        events.push(ChannelEvent {
-                            channel_idx: reader.spec.index,
-                            raw: Some(reader.buffer[..count].to_vec()),
-                            payload: ChannelPayload::Pending,
-                            timestamp,
-                        });
-                    } else {
-                        events.extend(frames.into_iter().enumerate().map(|(index, output)| {
-                            ChannelEvent {
-                                channel_idx: reader.spec.index,
-                                raw: (index == 0).then(|| reader.buffer[..count].to_vec()),
-                                payload: match output {
-                                    DecodeOutput::Frame(frame) => ChannelPayload::Defmt(frame),
-                                    DecodeOutput::Warning(warning) => {
-                                        ChannelPayload::Warning(warning)
-                                    }
-                                },
-                                timestamp,
-                            }
-                        }));
-                    }
+                    events.extend(frames.into_iter().map(|output| ChannelEvent {
+                        channel_idx: reader.spec.index,
+                        payload: match output {
+                            DecodeOutput::Frame(frame) => ChannelPayload::Defmt(frame),
+                            DecodeOutput::Warning(warning) => ChannelPayload::Warning(warning),
+                        },
+                        timestamp,
+                    }));
                 }
             }
         }
@@ -386,9 +374,7 @@ fn render_channel_bytes_colored_inner(
             write!(output, "[+{:>8.3}s] ", elapsed.as_secs_f64())?;
         }
 
-        if state.channel_labels
-            && (line_start || channel_switch)
-        {
+        if state.channel_labels && (line_start || channel_switch) {
             if let Some(channel_idx) = channel_idx {
                 if state.color {
                     write!(output, "{}", channel_color(channel_idx))?;
@@ -451,9 +437,6 @@ fn render_events(
 ) -> std::io::Result<()> {
     let mut logger = logger;
     for event in events {
-        if let (Some(logger), Some(raw)) = (logger.as_deref_mut(), event.raw.as_deref()) {
-            logger.write_raw(event.channel_idx, raw).map_err(io_error)?;
-        }
         match &event.payload {
             ChannelPayload::Bytes(bytes) => {
                 if let Some(logger) = logger.as_deref_mut() {
@@ -527,7 +510,6 @@ fn render_events(
                     output,
                 )?;
             }
-            ChannelPayload::Pending => {}
         }
     }
 
@@ -708,6 +690,13 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         );
     }
 
+    let mut logger = Logger::new(
+        config.log.as_deref(),
+        config.log_per_channel,
+        config.log_format,
+        config.up_specs.len(),
+    )?;
+
     if config.reset {
         core.reset()?;
     }
@@ -721,12 +710,6 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         crate::cli::ColorMode::Never => false,
         crate::cli::ColorMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
-    let mut logger = Logger::new(
-        config.log.as_deref(),
-        config.log_per_channel,
-        config.log_format,
-        config.up_specs.len(),
-    )?;
     let stdin_setup = interactive_input_available(rtt.down_channel(config.down_channel).is_some());
 
     let _raw_mode = if stdin_setup {
@@ -746,6 +729,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
                 .defmt
                 .as_ref()
                 .and_then(|defmt| defmt.locations.as_ref()),
+            logger.as_mut(),
         ) {
             Ok(events) => events,
             Err(err) => {
@@ -1021,13 +1005,11 @@ mod tests {
         let events = vec![
             ChannelEvent {
                 channel_idx: 2,
-                raw: None,
                 payload: ChannelPayload::Bytes(b"log\n".to_vec()),
                 timestamp: Instant::now(),
             },
             ChannelEvent {
                 channel_idx: 0,
-                raw: None,
                 payload: ChannelPayload::Bytes(b"shell".to_vec()),
                 timestamp: Instant::now(),
             },
@@ -1047,13 +1029,11 @@ mod tests {
         let events = vec![
             ChannelEvent {
                 channel_idx: 0,
-                raw: None,
                 payload: ChannelPayload::Bytes(b"zero\none".to_vec()),
                 timestamp: Instant::now(),
             },
             ChannelEvent {
                 channel_idx: 1,
-                raw: None,
                 payload: ChannelPayload::Bytes(b"one\n".to_vec()),
                 timestamp: Instant::now(),
             },
@@ -1077,7 +1057,6 @@ mod tests {
 
         let events = vec![ChannelEvent {
             channel_idx: 1,
-            raw: None,
             payload: ChannelPayload::Bytes(b"line\n".to_vec()),
             timestamp: Instant::now(),
         }];
@@ -1095,7 +1074,6 @@ mod tests {
     fn defmt_level_color_composes_after_channel_color() {
         let events = vec![ChannelEvent {
             channel_idx: 1,
-            raw: None,
             payload: ChannelPayload::Defmt(DecodedFrame {
                 message: "bad".to_string(),
                 timestamp: None,
@@ -1111,9 +1089,6 @@ mod tests {
 
         render_events(&events, &mut state, None, None, &mut output).unwrap();
 
-        assert_eq!(
-            output,
-            b"\x1b[35m[ch1] \x1b[0m\x1b[31merror bad\r\n\x1b[0m"
-        );
+        assert_eq!(output, b"\x1b[35m[ch1] \x1b[0m\x1b[31merror bad\r\n\x1b[0m");
     }
 }
