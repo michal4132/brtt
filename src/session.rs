@@ -11,7 +11,7 @@ use crossterm::{
 };
 use probe_rs::Core;
 use std::io::prelude::*;
-use std::io::stdout;
+use std::io::{stdout, IsTerminal};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -397,6 +397,10 @@ fn on_or_off(enabled: bool) -> &'static str {
     }
 }
 
+fn interactive_input_available(has_down_channel: bool) -> bool {
+    has_down_channel && std::io::stdin().is_terminal()
+}
+
 fn dispatch_command(
     command: SessionCommand,
     core: &mut Core,
@@ -497,7 +501,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         crate::cli::ColorMode::Never => false,
         crate::cli::ColorMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
-    let stdin_setup = rtt.down_channel(config.down_channel).is_some();
+    let stdin_setup = interactive_input_available(rtt.down_channel(config.down_channel).is_some());
 
     let _raw_mode = if stdin_setup {
         terminal::enable_raw_mode()?;
@@ -772,6 +776,11 @@ mod tests {
         let mut clear_output = Vec::new();
         clear_screen(&mut clear_output).unwrap();
         assert!(clear_output.starts_with(b"\x1b[2J"));
+    }
+
+    #[test]
+    fn non_terminal_input_does_not_block_headless_output() {
+        assert!(!interactive_input_available(false));
     }
 
     #[test]
