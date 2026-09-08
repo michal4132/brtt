@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use defmt_decoder::{Encoding, Locations, Table};
+use defmt_decoder::{Locations, Table};
 use defmt_parser::Level;
 use std::path::{Path, PathBuf};
 
@@ -16,8 +16,6 @@ pub(crate) struct DecodedFrame {
     pub(crate) timestamp: Option<String>,
     pub(crate) level: Option<Level>,
     pub(crate) module: Option<String>,
-    pub(crate) file: Option<PathBuf>,
-    pub(crate) line: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,16 +38,18 @@ pub(crate) fn decode_frames(
                 let location = locations.and_then(|locations| locations.get(&frame.index()));
                 frames.push(DecodeOutput::Frame(DecodedFrame {
                     message: frame.display_message().to_string(),
-                    timestamp: frame.display_timestamp().map(|timestamp| timestamp.to_string()),
+                    timestamp: frame
+                        .display_timestamp()
+                        .map(|timestamp| timestamp.to_string()),
                     level: frame.level(),
                     module: location.map(|location| location.module.clone()),
-                    file: location.map(|location| location.file.clone()),
-                    line: location.map(|location| location.line),
                 }));
             }
             Err(defmt_decoder::DecodeError::UnexpectedEof) => return Ok(frames),
             Err(error) if can_recover => {
-                frames.push(DecodeOutput::Warning(format!("defmt decode warning: {error}")));
+                frames.push(DecodeOutput::Warning(format!(
+                    "defmt decode warning: {error}"
+                )));
             }
             Err(error) => return Err(error),
         }
@@ -63,7 +63,9 @@ impl DefmtData {
             .with_context(|| format!("failed to read ELF '{}'", path.display()))?;
         let table = Table::parse(&bytes)
             .with_context(|| format!("failed to parse defmt table in '{}'", path.display()))?
-            .ok_or_else(|| anyhow::anyhow!("ELF '{}' contains no .defmt section", path.display()))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("ELF '{}' contains no .defmt section", path.display())
+            })?;
         let locations = table.get_locations(&bytes).ok();
 
         Ok(Self {
@@ -88,10 +90,6 @@ impl DefmtData {
         }
         Ok(())
     }
-
-    pub(crate) fn encoding(&self) -> Encoding {
-        self.table.encoding()
-    }
 }
 
 pub(crate) fn require_elf(path: Option<&Path>, has_defmt: bool) -> Result<Option<DefmtData>> {
@@ -99,7 +97,8 @@ pub(crate) fn require_elf(path: Option<&Path>, has_defmt: bool) -> Result<Option
         return Ok(None);
     }
 
-    let path = path.ok_or_else(|| anyhow::anyhow!("--elf is required when using an up channel with :defmt"))?;
+    let path = path
+        .ok_or_else(|| anyhow::anyhow!("--elf is required when using an up channel with :defmt"))?;
     Ok(Some(DefmtData::load(path)?))
 }
 
@@ -146,7 +145,10 @@ pub(crate) fn parse_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser:
     for item in spec.split(',').filter(|item| !item.trim().is_empty()) {
         let (module, level) = item.split_once('=').unwrap_or(("", item));
         if module.contains(char::is_whitespace) {
-            bail!("invalid defmt filter module '{}': whitespace is not allowed", module);
+            bail!(
+                "invalid defmt filter module '{}': whitespace is not allowed",
+                module
+            );
         }
         result.push((module.to_string(), parse_filter_level(level.trim())?));
     }
@@ -166,7 +168,9 @@ pub(crate) fn filter_level(
         let matches = if prefix.is_empty() {
             true
         } else {
-            module.is_some_and(|module| module == prefix || module.starts_with(&format!("{prefix}::")))
+            module.is_some_and(|module| {
+                module == prefix || module.starts_with(&format!("{prefix}::"))
+            })
         };
         if matches && prefix.len() >= best_len {
             selected = *level;
@@ -183,8 +187,17 @@ mod tests {
     #[test]
     fn filter_uses_longest_module_prefix() {
         let filters = parse_filter_spec("warn,app=info,app::net=debug").unwrap();
-        assert_eq!(filter_level(Some("app::net::tcp"), &filters), defmt_parser::Level::Debug);
-        assert_eq!(filter_level(Some("app::ui"), &filters), defmt_parser::Level::Info);
-        assert_eq!(filter_level(Some("other"), &filters), defmt_parser::Level::Warn);
+        assert_eq!(
+            filter_level(Some("app::net::tcp"), &filters),
+            defmt_parser::Level::Debug
+        );
+        assert_eq!(
+            filter_level(Some("app::ui"), &filters),
+            defmt_parser::Level::Info
+        );
+        assert_eq!(
+            filter_level(Some("other"), &filters),
+            defmt_parser::Level::Warn
+        );
     }
 }

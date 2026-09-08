@@ -1,5 +1,7 @@
 use crate::cli::{ChannelMode, ChannelSpec};
-use crate::defmt::{decode_frames, level_name, DecodeOutput, DecodedFrame, DefmtData};
+use crate::defmt::{
+    decode_frames, filter_level, level_enabled, level_name, DecodeOutput, DecodedFrame, DefmtData,
+};
 use anyhow::{bail, Context, Result};
 use brtt::rtt::Rtt;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -180,14 +182,8 @@ fn key_to_action(key: KeyEvent) -> InputAction {
     }
 }
 
-fn validate_channel_mode(spec: &ChannelSpec) -> Result<()> {
-    Ok(())
-}
-
 fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
     for spec in specs {
-        validate_channel_mode(spec)?;
-
         let channel = usize::try_from(spec.index).with_context(|| {
             format!(
                 "up channel index {} cannot be represented on this host",
@@ -239,7 +235,9 @@ fn poll_up_channels(
                         locations,
                         reader.defmt_can_recover,
                     )
-                    .with_context(|| format!("failed to decode defmt on up channel {}", reader.spec.index))?;
+                    .with_context(|| {
+                        format!("failed to decode defmt on up channel {}", reader.spec.index)
+                    })?;
                     events.extend(frames.into_iter().map(|output| ChannelEvent {
                         channel_idx: reader.spec.index,
                         payload: match output {
@@ -285,12 +283,19 @@ fn render_bytes(
 fn render_events(
     events: &[ChannelEvent],
     state: &mut SessionState,
+    filters: Option<&[(String, defmt_parser::Level)]>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     for event in events {
         match &event.payload {
             ChannelPayload::Bytes(bytes) => render_bytes(bytes, event.timestamp, state, output)?,
             ChannelPayload::Defmt(frame) => {
+                if let (Some(level), Some(filters)) = (frame.level, filters) {
+                    let minimum = filter_level(frame.module.as_deref(), filters);
+                    if !level_enabled(level, minimum) {
+                        continue;
+                    }
+                }
                 let mut line = String::new();
                 if let Some(timestamp) = &frame.timestamp {
                     line.push('[');
@@ -299,7 +304,7 @@ fn render_events(
                 }
                 if let Some(level) = frame.level {
                     line.push_str(level_name(level));
-                    line.push_str(" ");
+                    line.push(' ');
                 }
                 line.push_str(&frame.message);
                 line.push('\n');
@@ -321,7 +326,16 @@ fn render_events(
             }
             ChannelPayload::Warning(warning) => {
                 state.defmt_decode_warnings += 1;
-                render_bytes(format!("[defmt warning #{}] {warning}\n", state.defmt_decode_warnings).as_bytes(), event.timestamp, state, output)?;
+                render_bytes(
+                    format!(
+                        "[defmt warning #{}] {warning}\n",
+                        state.defmt_decode_warnings
+                    )
+                    .as_bytes(),
+                    event.timestamp,
+                    state,
+                    output,
+                )?;
             }
         }
     }
@@ -498,7 +512,10 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
             &mut rtt,
             core,
             &mut up_readers,
-            config.defmt.as_ref().and_then(|defmt| defmt.locations.as_ref()),
+            config
+                .defmt
+                .as_ref()
+                .and_then(|defmt| defmt.locations.as_ref()),
         ) {
             Ok(events) => events,
             Err(err) => {
@@ -507,7 +524,12 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         };
 
         if !events.is_empty() {
-            if let Err(err) = render_events(&events, &mut state, &mut output) {
+            if let Err(err) = render_events(
+                &events,
+                &mut state,
+                config.defmt_filters.as_deref(),
+                &mut output,
+            ) {
                 break 'read_loop Err(anyhow::anyhow!("Error writing to stdout: {err}"));
             }
         }
@@ -769,7 +791,7 @@ mod tests {
         let mut output = Vec::new();
         let mut state = SessionState::new();
 
-        render_events(&events, &mut state, &mut output).unwrap();
+        render_events(&events, &mut state, None, &mut output).unwrap();
 
         assert_eq!(events[0].channel_idx, 2);
         assert_eq!(events[1].channel_idx, 0);

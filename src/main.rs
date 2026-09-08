@@ -17,14 +17,19 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
 
     let up_specs = configured_up_specs(&opts.up);
+    let defmt_filters = opts
+        .defmt_filter
+        .as_deref()
+        .map(defmt::parse_filter_spec)
+        .transpose()?;
     let defmt_data = defmt::require_elf(
         opts.elf.as_deref(),
         up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
     )?;
     if opts.debug_defmt_table {
-        let data = defmt_data
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("--debug-defmt-table requires --elf with a defmt table"))?;
+        let data = defmt_data.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--debug-defmt-table requires --elf with a defmt table")
+        })?;
         data.debug_summary(&mut std::io::stdout())?;
         return Ok(());
     }
@@ -118,11 +123,7 @@ fn main() -> Result<()> {
             poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
             defmt: defmt_data,
-            defmt_filters: opts
-                .defmt_filter
-                .as_deref()
-                .map(defmt::parse_filter_spec)
-                .transpose()?,
+            defmt_filters,
             color: opts.color,
         },
     )
