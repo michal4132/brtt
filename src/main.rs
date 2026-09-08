@@ -24,7 +24,8 @@ fn main() -> Result<()> {
         .transpose()?;
     let defmt_data = defmt::require_elf(
         opts.elf.as_deref(),
-        up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
+        opts.debug_defmt_table
+            || up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
     )?;
     if opts.debug_defmt_table {
         let data = defmt_data.as_ref().ok_or_else(|| {

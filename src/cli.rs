@@ -180,7 +180,11 @@ pub(crate) struct Opts {
     #[clap(long, help = "Print the loaded defmt table and exit.")]
     pub(crate) debug_defmt_table: bool,
 
-    #[clap(long, value_name = "SPEC", help = "Filter defmt output, e.g. warn or app=debug,warn.")]
+    #[clap(
+        long,
+        value_name = "SPEC",
+        help = "Filter defmt output, e.g. warn or app=debug,warn."
+    )]
     pub(crate) defmt_filter: Option<String>,
 
     #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
