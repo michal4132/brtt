@@ -283,7 +283,7 @@ fn render_bytes(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    render_channel_bytes(bytes, None, timestamp, state, output)
+    render_channel_bytes_colored(bytes, None, timestamp, state, output, None)
 }
 
 fn render_channel_bytes(
@@ -293,15 +293,28 @@ fn render_channel_bytes(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
+    render_channel_bytes_colored(bytes, channel_idx, timestamp, state, output, None)
+}
+
+fn render_channel_bytes_colored(
+    bytes: &[u8],
+    channel_idx: Option<u32>,
+    timestamp: Instant,
+    state: &mut SessionState,
+    output: &mut impl Write,
+    line_color: Option<&str>,
+) -> std::io::Result<()> {
     for &byte in bytes {
         let line_start = state.line_start;
+        let channel_switch =
+            channel_idx.is_some() && state.last_channel != channel_idx && state.channel_labels;
         if state.timestamps && line_start {
             let elapsed = timestamp.saturating_duration_since(state.started);
             write!(output, "[+{:>8.3}s] ", elapsed.as_secs_f64())?;
         }
 
         if state.channel_labels
-            && (line_start || channel_idx.is_some() && state.last_channel != channel_idx)
+            && (line_start || channel_switch)
         {
             if let Some(channel_idx) = channel_idx {
                 if state.color {
@@ -312,6 +325,12 @@ fn render_channel_bytes(
                     output.write_all(b"\x1b[0m")?;
                 }
                 state.last_channel = Some(channel_idx);
+            }
+        }
+
+        if let Some(line_color) = line_color {
+            if line_start || channel_switch {
+                output.write_all(line_color.as_bytes())?;
             }
         }
 
@@ -326,6 +345,13 @@ fn render_channel_bytes(
             state.line_start = false;
         }
         output.write_all(&[byte])?;
+        if byte == b'\n' && line_color.is_some() {
+            output.write_all(b"\x1b[0m")?;
+        }
+    }
+
+    if line_color.is_some() && !state.line_start {
+        output.write_all(b"\x1b[0m")?;
     }
 
     Ok(())
@@ -388,26 +414,19 @@ fn render_events(
                         .write_decoded(event.channel_idx, line.as_bytes(), state.channel_labels)
                         .map_err(io_error)?;
                 }
-                if state.color {
-                    let color = match frame.level {
-                        Some(defmt_parser::Level::Error) => "\x1b[31m",
-                        Some(defmt_parser::Level::Warn) => "\x1b[33m",
-                        Some(defmt_parser::Level::Debug | defmt_parser::Level::Trace) => "\x1b[2m",
-                        _ => "",
-                    };
-                    if !color.is_empty() {
-                        output.write_all(color.as_bytes())?;
-                        output.write_all(line.as_bytes())?;
-                        output.write_all(b"\x1b[0m")?;
-                        continue;
-                    }
-                }
-                render_channel_bytes(
+                let level_color = if state.color {
+                    let color = defmt_level_color(frame.level);
+                    (!color.is_empty()).then_some(color)
+                } else {
+                    None
+                };
+                render_channel_bytes_colored(
                     line.as_bytes(),
                     Some(event.channel_idx),
                     event.timestamp,
                     state,
                     output,
+                    level_color,
                 )?;
             }
             ChannelPayload::Warning(warning) => {
@@ -434,6 +453,15 @@ fn render_events(
     }
 
     output.flush()
+}
+
+fn defmt_level_color(level: Option<defmt_parser::Level>) -> &'static str {
+    match level {
+        Some(defmt_parser::Level::Error) => "\x1b[31m",
+        Some(defmt_parser::Level::Warn) => "\x1b[33m",
+        Some(defmt_parser::Level::Debug | defmt_parser::Level::Trace) => "\x1b[2m",
+        _ => "",
+    }
 }
 
 fn io_error(error: anyhow::Error) -> std::io::Error {
@@ -967,5 +995,31 @@ mod tests {
         render_events(&events, &mut state, None, None, &mut output).unwrap();
 
         assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\r\n");
+    }
+
+    #[test]
+    fn defmt_level_color_composes_after_channel_color() {
+        let events = vec![ChannelEvent {
+            channel_idx: 1,
+            raw: None,
+            payload: ChannelPayload::Defmt(DecodedFrame {
+                message: "bad".to_string(),
+                timestamp: None,
+                level: Some(defmt_parser::Level::Error),
+                module: None,
+            }),
+            timestamp: Instant::now(),
+        }];
+        let mut output = Vec::new();
+        let mut state = SessionState::new();
+        state.channel_labels = true;
+        state.color = true;
+
+        render_events(&events, &mut state, None, None, &mut output).unwrap();
+
+        assert_eq!(
+            output,
+            b"\x1b[35m[ch1] \x1b[0m\x1b[31merror bad\r\n\x1b[0m"
+        );
     }
 }
