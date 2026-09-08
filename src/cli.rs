@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use brtt::rtt::ScanRegion;
+use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum ProbeInfo {
@@ -141,7 +142,7 @@ pub(crate) struct Opts {
         long,
         action = clap::ArgAction::Append,
         value_name = "CHANNEL[:MODE]",
-        help = "Up channel specification. MODE is ascii or defmt; defaults to ascii. May be repeated; defmt decoding is not implemented yet."
+        help = "Up channel specification. MODE is ascii or defmt; defaults to ascii. May be repeated."
     )]
     pub(crate) up: Vec<ChannelSpec>,
 
@@ -172,6 +173,25 @@ pub(crate) struct Opts {
         help = "Memory region to scan for control block. You can specify either an exact starting address '0x1000' or a range such as '0x0000..0x1000'. Both decimal and hex are accepted."
     )]
     pub(crate) scan_region: ScanRegion,
+
+    #[clap(long, value_name = "PATH", help = "ELF containing the defmt table.")]
+    pub(crate) elf: Option<PathBuf>,
+
+    #[clap(long, help = "Print the loaded defmt table and exit.")]
+    pub(crate) debug_defmt_table: bool,
+
+    #[clap(long, value_name = "SPEC", help = "Filter defmt output, e.g. warn or app=debug,warn.")]
+    pub(crate) defmt_filter: Option<String>,
+
+    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
+    pub(crate) color: ColorMode,
+}
+
+#[derive(Debug, clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 pub(crate) fn selected_channel(specs: &[ChannelSpec], direction: &str) -> Result<usize> {

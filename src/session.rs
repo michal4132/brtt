@@ -1,4 +1,5 @@
 use crate::cli::{ChannelMode, ChannelSpec};
+use crate::defmt::{decode_frames, level_name, DecodedFrame, DefmtData};
 use anyhow::{bail, Context, Result};
 use brtt::rtt::Rtt;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -14,22 +15,34 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 struct ChannelEvent {
     channel_idx: u32,
-    mode: ChannelMode,
-    bytes: Vec<u8>,
+    payload: ChannelPayload,
     timestamp: Instant,
 }
 
-struct UpChannelReader {
-    spec: ChannelSpec,
-    buffer: [u8; 128],
+#[derive(Debug)]
+enum ChannelPayload {
+    Bytes(Vec<u8>),
+    Defmt(DecodedFrame),
 }
 
-impl UpChannelReader {
-    fn new(spec: ChannelSpec) -> Self {
-        Self {
+struct UpChannelReader<'table> {
+    spec: ChannelSpec,
+    buffer: [u8; 128],
+    decoder: Option<Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>>,
+}
+
+impl<'table> UpChannelReader<'table> {
+    fn new(spec: ChannelSpec, defmt: Option<&'table DefmtData>) -> Result<Self> {
+        let decoder = match (spec.mode, defmt) {
+            (ChannelMode::Defmt, Some(defmt)) => Some(defmt.table.new_stream_decoder()),
+            (ChannelMode::Defmt, None) => bail!("missing defmt table for channel {}", spec.index),
+            _ => None,
+        };
+        Ok(Self {
             spec,
             buffer: [0; 128],
-        }
+            decoder,
+        })
     }
 }
 
@@ -161,13 +174,6 @@ fn key_to_action(key: KeyEvent) -> InputAction {
 }
 
 fn validate_channel_mode(spec: &ChannelSpec) -> Result<()> {
-    if spec.mode == ChannelMode::Defmt {
-        bail!(
-            "Defmt output for up channel {} is not implemented yet; use :ascii or :ascii",
-            spec.index
-        );
-    }
-
     Ok(())
 }
 
@@ -193,7 +199,8 @@ fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
 fn poll_up_channels(
     rtt: &mut Rtt,
     core: &mut Core,
-    readers: &mut [UpChannelReader],
+    readers: &mut [UpChannelReader<'_>],
+    locations: Option<&defmt_decoder::Locations>,
 ) -> Result<Vec<ChannelEvent>> {
     let mut events = Vec::with_capacity(readers.len());
 
@@ -211,12 +218,27 @@ fn poll_up_channels(
         };
 
         if count > 0 {
-            events.push(ChannelEvent {
-                channel_idx: reader.spec.index,
-                mode: reader.spec.mode,
-                bytes: reader.buffer[..count].to_vec(),
-                timestamp: Instant::now(),
-            });
+            let timestamp = Instant::now();
+            match reader.spec.mode {
+                ChannelMode::Ascii | ChannelMode::Ascii => events.push(ChannelEvent {
+                    channel_idx: reader.spec.index,
+                    payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
+                    timestamp,
+                }),
+                ChannelMode::Defmt => {
+                    let frames = decode_frames(
+                        &mut **reader.decoder.as_mut().expect("defmt decoder initialized"),
+                        &reader.buffer[..count],
+                        locations,
+                    )
+                    .with_context(|| format!("failed to decode defmt on up channel {}", reader.spec.index))?;
+                    events.extend(frames.into_iter().map(|frame| ChannelEvent {
+                        channel_idx: reader.spec.index,
+                        payload: ChannelPayload::Defmt(frame),
+                        timestamp,
+                    }));
+                }
+            }
         }
     }
 
@@ -255,14 +277,23 @@ fn render_events(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     for event in events {
-        match event.mode {
-            ChannelMode::Ascii | ChannelMode::Ascii => {
-                render_bytes(&event.bytes, event.timestamp, state, output)?;
+        match &event.payload {
+            ChannelPayload::Bytes(bytes) => render_bytes(bytes, event.timestamp, state, output)?,
+            ChannelPayload::Defmt(frame) => {
+                let mut line = String::new();
+                if let Some(timestamp) = &frame.timestamp {
+                    line.push('[');
+                    line.push_str(timestamp);
+                    line.push_str("] ");
+                }
+                if let Some(level) = frame.level {
+                    line.push_str(level_name(level));
+                    line.push_str(" ");
+                }
+                line.push_str(&frame.message);
+                line.push('\n');
+                render_bytes(line.as_bytes(), event.timestamp, state, output)?;
             }
-            ChannelMode::Defmt => unreachable!(
-                "defmt event from channel {} was not rejected before polling",
-                event.channel_idx
-            ),
         }
     }
 
@@ -379,6 +410,9 @@ pub(crate) struct SessionConfig {
     pub(crate) down_configured: bool,
     pub(crate) poll_interval: Duration,
     pub(crate) reset: bool,
+    pub(crate) defmt: Option<DefmtData>,
+    pub(crate) defmt_filters: Option<Vec<(String, defmt_parser::Level)>>,
+    pub(crate) color: crate::cli::ColorMode,
 }
 
 struct RawModeGuard;
@@ -393,12 +427,13 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     if config.up_configured {
         validate_up_specs(&mut rtt, &config.up_specs)?;
     }
+    let defmt_ref = config.defmt.as_ref();
     let mut up_readers = config
         .up_specs
         .iter()
         .copied()
-        .map(UpChannelReader::new)
-        .collect::<Vec<_>>();
+        .map(|spec| UpChannelReader::new(spec, defmt_ref))
+        .collect::<Result<Vec<_>>>()?;
 
     if config.down_configured && rtt.down_channel(config.down_channel).is_none() {
         bail!(
@@ -425,7 +460,12 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
 
     let mut output = stdout();
     let result = 'read_loop: loop {
-        let events = match poll_up_channels(&mut rtt, core, &mut up_readers) {
+        let events = match poll_up_channels(
+            &mut rtt,
+            core,
+            &mut up_readers,
+            config.defmt.as_ref().and_then(|defmt| defmt.locations.as_ref()),
+        ) {
             Ok(events) => events,
             Err(err) => {
                 break 'read_loop Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
@@ -658,6 +698,9 @@ mod tests {
             down_configured: true,
             poll_interval: Duration::from_millis(10),
             reset: false,
+            defmt: None,
+            defmt_filters: None,
+            color: crate::cli::ColorMode::Never,
         };
         let state = SessionState::new();
         let mut output = Vec::new();
@@ -680,14 +723,12 @@ mod tests {
         let events = vec![
             ChannelEvent {
                 channel_idx: 2,
-                mode: ChannelMode::Ascii,
-                bytes: b"log\n".to_vec(),
+                payload: ChannelPayload::Bytes(b"log\n".to_vec()),
                 timestamp: Instant::now(),
             },
             ChannelEvent {
                 channel_idx: 0,
-                mode: ChannelMode::Ascii,
-                bytes: b"shell".to_vec(),
+                payload: ChannelPayload::Bytes(b"shell".to_vec()),
                 timestamp: Instant::now(),
             },
         ];
