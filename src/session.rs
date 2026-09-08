@@ -58,6 +58,8 @@ struct SessionState {
     started: Instant,
     defmt_decode_warnings: u64,
     color: bool,
+    channel_labels: bool,
+    last_channel: Option<u32>,
 }
 
 impl SessionState {
@@ -69,6 +71,8 @@ impl SessionState {
             started: Instant::now(),
             defmt_decode_warnings: 0,
             color: false,
+            channel_labels: false,
+            last_channel: None,
         }
     }
 }
@@ -261,10 +265,39 @@ fn render_bytes(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
+    render_channel_bytes(bytes, None, timestamp, state, output)
+}
+
+fn render_channel_bytes(
+    bytes: &[u8],
+    channel_idx: Option<u32>,
+    timestamp: Instant,
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
     for &byte in bytes {
-        if state.timestamps && state.line_start {
+        let line_start = state.line_start;
+        if state.timestamps && line_start {
             let elapsed = timestamp.saturating_duration_since(state.started);
             write!(output, "[+{:>8.3}s] ", elapsed.as_secs_f64())?;
+        }
+
+        if state.channel_labels
+            && (line_start || channel_idx.is_some() && state.last_channel != channel_idx)
+        {
+            if let Some(channel_idx) = channel_idx {
+                if state.color {
+                    write!(output, "{}", channel_color(channel_idx))?;
+                }
+                write!(output, "[ch{channel_idx}] ")?;
+                if state.color {
+                    output.write_all(b"\x1b[0m")?;
+                }
+                state.last_channel = Some(channel_idx);
+            }
+        }
+
+        if line_start {
             state.line_start = false;
         }
 
@@ -280,6 +313,12 @@ fn render_bytes(
     Ok(())
 }
 
+fn channel_color(channel_idx: u32) -> &'static str {
+    [
+        "\x1b[36m", "\x1b[35m", "\x1b[34m", "\x1b[32m", "\x1b[33m", "\x1b[31m",
+    ][channel_idx as usize % 6]
+}
+
 fn render_events(
     events: &[ChannelEvent],
     state: &mut SessionState,
@@ -288,7 +327,13 @@ fn render_events(
 ) -> std::io::Result<()> {
     for event in events {
         match &event.payload {
-            ChannelPayload::Bytes(bytes) => render_bytes(bytes, event.timestamp, state, output)?,
+            ChannelPayload::Bytes(bytes) => render_channel_bytes(
+                bytes,
+                Some(event.channel_idx),
+                event.timestamp,
+                state,
+                output,
+            )?,
             ChannelPayload::Defmt(frame) => {
                 if let (Some(level), Some(filters)) = (frame.level, filters) {
                     let minimum = filter_level(frame.module.as_deref(), filters);
@@ -322,16 +367,23 @@ fn render_events(
                         continue;
                     }
                 }
-                render_bytes(line.as_bytes(), event.timestamp, state, output)?;
+                render_channel_bytes(
+                    line.as_bytes(),
+                    Some(event.channel_idx),
+                    event.timestamp,
+                    state,
+                    output,
+                )?;
             }
             ChannelPayload::Warning(warning) => {
                 state.defmt_decode_warnings += 1;
-                render_bytes(
+                render_channel_bytes(
                     format!(
                         "[defmt warning #{}] {warning}\n",
                         state.defmt_decode_warnings
                     )
                     .as_bytes(),
+                    Some(event.channel_idx),
                     event.timestamp,
                     state,
                     output,
@@ -496,6 +548,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
     let mut state = SessionState::new();
+    state.channel_labels = config.up_specs.len() > 1;
     state.color = match config.color {
         crate::cli::ColorMode::Always => true,
         crate::cli::ColorMode::Never => false,
@@ -805,5 +858,48 @@ mod tests {
         assert_eq!(events[0].channel_idx, 2);
         assert_eq!(events[1].channel_idx, 0);
         assert_eq!(output, b"log\r\nshell");
+    }
+
+    #[test]
+    fn multiple_channels_are_labeled_on_each_line() {
+        let events = vec![
+            ChannelEvent {
+                channel_idx: 0,
+                payload: ChannelPayload::Bytes(b"zero\none".to_vec()),
+                timestamp: Instant::now(),
+            },
+            ChannelEvent {
+                channel_idx: 1,
+                payload: ChannelPayload::Bytes(b"one\n".to_vec()),
+                timestamp: Instant::now(),
+            },
+        ];
+        let mut output = Vec::new();
+        let mut state = SessionState::new();
+        state.channel_labels = true;
+
+        render_events(&events, &mut state, None, &mut output).unwrap();
+
+        assert_eq!(output, b"[ch0] zero\r\n[ch0] one[ch1] one\r\n");
+    }
+
+    #[test]
+    fn channel_labels_use_stable_palette_colors() {
+        assert_eq!(channel_color(0), "\x1b[36m");
+        assert_eq!(channel_color(6), channel_color(0));
+
+        let events = vec![ChannelEvent {
+            channel_idx: 1,
+            payload: ChannelPayload::Bytes(b"line\n".to_vec()),
+            timestamp: Instant::now(),
+        }];
+        let mut output = Vec::new();
+        let mut state = SessionState::new();
+        state.channel_labels = true;
+        state.color = true;
+
+        render_events(&events, &mut state, None, &mut output).unwrap();
+
+        assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\r\n");
     }
 }
