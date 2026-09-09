@@ -13,6 +13,7 @@ use crossterm::{
 use probe_rs::Core;
 use std::io::prelude::*;
 use std::io::{stdout, IsTerminal};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -61,8 +62,19 @@ struct SessionState {
     color: bool,
     channel_labels: bool,
     last_channel: Option<u32>,
-    line_channel: Option<u32>,
-    line_bytes: Vec<u8>,
+    streams: HashMap<u32, TextStream>,
+    foreground: Option<ForegroundLine>,
+    interactive: bool,
+}
+
+struct TextStream {
+    bytes: Vec<u8>,
+    pending_cr: bool,
+}
+
+struct ForegroundLine {
+    channel: u32,
+    bytes: Vec<u8>,
 }
 
 impl SessionState {
@@ -76,8 +88,9 @@ impl SessionState {
             color: false,
             channel_labels: false,
             last_channel: None,
-            line_channel: None,
-            line_bytes: Vec::new(),
+            streams: HashMap::new(),
+            foreground: None,
+            interactive: true,
         }
     }
 }
@@ -296,62 +309,21 @@ fn render_channel_bytes_colored(
     output: &mut impl Write,
     line_color: Option<&'static str>,
 ) -> std::io::Result<()> {
-    let suspended = if !state.line_start && state.line_channel != channel_idx {
-        let saved = PartialLine {
-            bytes: std::mem::take(&mut state.line_bytes),
-            channel_idx: state.line_channel.or(state.last_channel),
-            timestamp: Instant::now(),
-        };
-        output.write_all(b"\r\x1b[2K")?;
-        state.line_start = true;
-        state.line_channel = None;
-        state.last_channel = None;
-        Some(saved)
-    } else {
-        None
-    };
-
     render_channel_bytes_colored_inner(bytes, channel_idx, timestamp, state, output, line_color)?;
-
-    if let Some(saved) = suspended {
-        state.line_start = true;
-        state.last_channel = None;
-        render_channel_bytes_colored_inner(
-            &saved.bytes,
-            saved.channel_idx,
-            saved.timestamp,
-            state,
-            output,
-            None,
-        )?;
-    }
     Ok(())
 }
 
-struct PartialLine {
-    bytes: Vec<u8>,
-    channel_idx: Option<u32>,
-    timestamp: Instant,
-}
-
-fn suspend_partial_line(
+fn erase_foreground(
     state: &mut SessionState,
     output: &mut impl Write,
-) -> std::io::Result<Option<PartialLine>> {
-    if state.line_start {
-        return Ok(None);
+) -> std::io::Result<Option<ForegroundLine>> {
+    let foreground = state.foreground.take();
+    if foreground.is_some() && state.interactive {
+        output.write_all(b"\r\x1b[2K")?;
     }
-
-    let saved = PartialLine {
-        bytes: std::mem::take(&mut state.line_bytes),
-        channel_idx: state.line_channel.or(state.last_channel),
-        timestamp: Instant::now(),
-    };
-    output.write_all(b"\r\x1b[2K")?;
     state.line_start = true;
-    state.line_channel = None;
     state.last_channel = None;
-    Ok(Some(saved))
+    Ok(foreground)
 }
 
 fn render_channel_bytes_colored_inner(
@@ -362,10 +334,12 @@ fn render_channel_bytes_colored_inner(
     output: &mut impl Write,
     line_color: Option<&'static str>,
 ) -> std::io::Result<()> {
-    if !bytes.is_empty() {
-        state.line_channel = channel_idx;
-    }
     for &byte in bytes {
+        if byte == b'\r' {
+            output.write_all(b"\r")?;
+            state.line_start = true;
+            continue;
+        }
         let line_start = state.line_start;
         let channel_switch =
             channel_idx.is_some() && state.last_channel != channel_idx && state.channel_labels;
@@ -404,12 +378,6 @@ fn render_channel_bytes_colored_inner(
             state.line_start = false;
         }
         output.write_all(&[byte])?;
-        if byte != b'\n' {
-            state.line_bytes.push(byte);
-        } else {
-            state.line_bytes.clear();
-            state.line_channel = None;
-        }
         if byte == b'\n' && line_color.is_some() {
             output.write_all(b"\x1b[0m")?;
         }
@@ -419,6 +387,83 @@ fn render_channel_bytes_colored_inner(
         output.write_all(b"\x1b[0m")?;
     }
 
+    Ok(())
+}
+
+fn render_ascii_chunk(
+    channel: u32,
+    bytes: &[u8],
+    timestamp: Instant,
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let (complete, partial) = {
+        let stream = state.streams.entry(channel).or_insert_with(|| TextStream {
+            bytes: Vec::new(),
+            pending_cr: false,
+        });
+        let mut complete = Vec::new();
+        for &byte in bytes {
+            if stream.pending_cr {
+                stream.pending_cr = false;
+                if byte == b'\n' {
+                    complete.push(std::mem::take(&mut stream.bytes));
+                    continue;
+                }
+                stream.bytes.clear();
+            }
+            match byte {
+                b'\r' => stream.pending_cr = true,
+                b'\n' => complete.push(std::mem::take(&mut stream.bytes)),
+                byte => stream.bytes.push(byte),
+            }
+        }
+        (complete, stream.bytes.clone())
+    };
+
+    for line in complete {
+        let foreground = erase_foreground(state, output)?;
+        render_channel_bytes(&line, Some(channel), timestamp, state, output)?;
+        output.write_all(b"\r\n")?;
+        state.line_start = true;
+        if let Some(saved) = foreground {
+            if saved.channel != channel {
+                render_channel_bytes(&saved.bytes, Some(saved.channel), timestamp, state, output)?;
+                state.foreground = Some(saved);
+            }
+        }
+    }
+
+    if !partial.is_empty() && state.interactive {
+        if state.foreground.as_ref().map(|line| line.channel) == Some(channel) {
+            erase_foreground(state, output)?;
+        } else if state.foreground.is_some() {
+            return Ok(());
+        }
+        render_channel_bytes(&partial, Some(channel), timestamp, state, output)?;
+        state.foreground = Some(ForegroundLine { channel, bytes: partial });
+    }
+    Ok(())
+}
+
+fn render_complete_line(
+    channel: u32,
+    bytes: &[u8],
+    timestamp: Instant,
+    color: Option<&'static str>,
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let foreground = erase_foreground(state, output)?;
+    render_channel_bytes_colored(bytes, Some(channel), timestamp, state, output, color)?;
+    if !state.line_start {
+        output.write_all(b"\r\n")?;
+        state.line_start = true;
+    }
+    if let Some(saved) = foreground {
+        render_channel_bytes(&saved.bytes, Some(saved.channel), timestamp, state, output)?;
+        state.foreground = Some(saved);
+    }
     Ok(())
 }
 
@@ -444,13 +489,7 @@ fn render_events(
                         .write_decoded(event.channel_idx, bytes, state.channel_labels)
                         .map_err(io_error)?;
                 }
-                render_channel_bytes(
-                    bytes,
-                    Some(event.channel_idx),
-                    event.timestamp,
-                    state,
-                    output,
-                )?
+                render_ascii_chunk(event.channel_idx, bytes, event.timestamp, state, output)?
             }
             ChannelPayload::Defmt(frame) => {
                 if let (Some(level), Some(filters)) = (frame.level, filters) {
@@ -482,13 +521,13 @@ fn render_events(
                 } else {
                     None
                 };
-                render_channel_bytes_colored(
+                render_complete_line(
+                    event.channel_idx,
                     line.as_bytes(),
-                    Some(event.channel_idx),
                     event.timestamp,
+                    level_color,
                     state,
                     output,
-                    level_color,
                 )?;
             }
             ChannelPayload::Warning(warning) => {
@@ -502,10 +541,11 @@ fn render_events(
                         .write_decoded(event.channel_idx, line.as_bytes(), state.channel_labels)
                         .map_err(io_error)?;
                 }
-                render_channel_bytes(
+                render_complete_line(
+                    event.channel_idx,
                     line.as_bytes(),
-                    Some(event.channel_idx),
                     event.timestamp,
+                    None,
                     state,
                     output,
                 )?;
@@ -593,7 +633,7 @@ fn dispatch_command(
     if command == SessionCommand::Quit {
         return Ok(true);
     }
-    let suspended = suspend_partial_line(state, output)?;
+    let suspended = erase_foreground(state, output)?;
     match command {
         SessionCommand::Quit => unreachable!("quit handled before rendering command output"),
         SessionCommand::Help => {
@@ -635,8 +675,8 @@ fn dispatch_command(
         state.last_channel = None;
         render_channel_bytes_colored_inner(
             &saved.bytes,
-            saved.channel_idx,
-            saved.timestamp,
+            Some(saved.channel),
+            Instant::now(),
             state,
             output,
             None,
@@ -704,6 +744,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
     let mut state = SessionState::new();
+    state.interactive = std::io::stdout().is_terminal();
     state.channel_labels = config.up_specs.len() > 1;
     state.color = match config.color {
         crate::cli::ColorMode::Always => true,
@@ -956,6 +997,30 @@ mod tests {
         render_bytes(b"text\n", Instant::now(), &mut state, &mut output).unwrap();
 
         assert_eq!(output, b"text\r\n");
+    }
+
+    #[test]
+    fn carriage_return_newline_is_not_rendered_as_two_lines() {
+        let mut state = SessionState::new();
+        state.channel_labels = true;
+        let mut output = Vec::new();
+
+        render_ascii_chunk(0, b"first\r\nsecond\r\n", Instant::now(), &mut state, &mut output)
+            .unwrap();
+
+        assert_eq!(output, b"[ch0] first\r\n[ch0] second\r\n");
+    }
+
+    #[test]
+    fn completed_line_does_not_restore_its_consumed_partial_prompt() {
+        let mut state = SessionState::new();
+        state.channel_labels = true;
+        let mut output = Vec::new();
+
+        render_ascii_chunk(0, b"> ", Instant::now(), &mut state, &mut output).unwrap();
+        render_ascii_chunk(0, b"help\r\n", Instant::now(), &mut state, &mut output).unwrap();
+
+        assert_eq!(output, b"[ch0] > \r\x1b[2K[ch0] > help\r\n");
     }
 
     #[test]
