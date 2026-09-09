@@ -129,6 +129,7 @@ fn main() -> Result<()> {
             down_configured: !opts.no_down,
             poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
+            timestamps: opts.timestamps,
             defmt: defmt_data,
             defmt_filters,
             color: opts.color,

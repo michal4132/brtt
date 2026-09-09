@@ -17,6 +17,7 @@ brtt [OPTIONS]
 - `-d, --down <CHANNEL>`: The RTT "down" channel (host to target) for keyboard input. Only one channel is supported and it defaults to channel 0.
 - `--no-down`: Disable the default down channel and keyboard input for output-only sessions.
 - `-r, --reset`: Reset the target after opening the RTT session.
+- `-t, --timestamp`: Enable local date and time timestamps with millisecond precision. `Ctrl-T t` toggles them during a session.
 - `--poll-interval <MILLISECONDS>`: Polling interval for RTT and keyboard input. [default: 10]
 - `--scan-region <SCAN_REGION>`: Specify a memory region to scan for the RTT control block. Can be an exact address (e.g., `0x20000000`) or a range (e.g., `0x20000000..0x20010000`).
 - `--elf <PATH>`: ELF containing the defmt table; required for `:defmt` channels.

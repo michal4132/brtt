@@ -157,6 +157,13 @@ pub(crate) struct Opts {
     pub(crate) reset: bool,
 
     #[clap(
+        short = 't',
+        long = "timestamp",
+        help = "Enable local date and time timestamps with millisecond precision."
+    )]
+    pub(crate) timestamps: bool,
+
+    #[clap(
         long,
         default_value = "10",
         value_name = "MILLISECONDS",
@@ -273,6 +280,7 @@ impl Opts {
                 || self.down.is_some()
                 || self.no_down
                 || self.reset
+                || self.timestamps
                 || self.log.is_some()
                 || self.log_per_channel
                 || self.log_format.is_some()
@@ -291,6 +299,7 @@ impl Opts {
                     || self.down.is_some()
                     || self.no_down
                     || self.reset
+                    || self.timestamps
                     || self.log.is_some()
                     || self.log_per_channel
                     || self.log_format.is_some()
@@ -311,6 +320,7 @@ impl Opts {
                 || self.down.is_some()
                 || self.no_down
                 || self.reset
+                || self.timestamps
                 || self.log.is_some()
                 || self.log_per_channel
                 || self.log_format.is_some()
@@ -330,6 +340,7 @@ impl Opts {
                 || self.down.is_some()
                 || self.no_down
                 || self.reset
+                || self.timestamps
                 || self.log.is_some()
                 || self.log_per_channel
                 || self.log_format.is_some()
@@ -480,6 +491,14 @@ mod tests {
 
         assert!(opts.up.is_empty());
         assert!(opts.down.is_none());
+        assert!(!opts.timestamps);
+    }
+
+    #[test]
+    fn opts_accept_startup_timestamps() {
+        let opts = Opts::try_parse_from(["brtt", "--timestamp"]).unwrap();
+
+        assert!(opts.timestamps);
     }
 
     fn validate_args(args: &[&str]) -> std::result::Result<(), String> {

@@ -5,6 +5,7 @@ use crate::defmt::{
 use crate::logger::Logger;
 use anyhow::{bail, Context, Result};
 use brtt::rtt::Rtt;
+use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{
     cursor, execute,
@@ -58,6 +59,7 @@ struct SessionState {
     local_echo: bool,
     line_start: bool,
     started: Instant,
+    started_wall: DateTime<Local>,
     defmt_decode_warnings: u64,
     color: bool,
     channel_labels: bool,
@@ -84,6 +86,7 @@ impl SessionState {
             local_echo: false,
             line_start: true,
             started: Instant::now(),
+            started_wall: Local::now(),
             defmt_decode_warnings: 0,
             color: false,
             channel_labels: false,
@@ -345,7 +348,13 @@ fn render_channel_bytes_colored_inner(
             channel_idx.is_some() && state.last_channel != channel_idx && state.channel_labels;
         if state.timestamps && line_start {
             let elapsed = timestamp.saturating_duration_since(state.started);
-            write!(output, "[+{:>8.3}s] ", elapsed.as_secs_f64())?;
+            let wall_timestamp = state.started_wall
+                + chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero());
+            write!(
+                output,
+                "[{}] ",
+                wall_timestamp.format("%Y-%m-%d %H:%M:%S%.3f")
+            )?;
         }
 
         if state.channel_labels && (line_start || channel_switch) {
@@ -702,6 +711,7 @@ pub(crate) struct SessionConfig {
     pub(crate) down_configured: bool,
     pub(crate) poll_interval: Duration,
     pub(crate) reset: bool,
+    pub(crate) timestamps: bool,
     pub(crate) defmt: Option<DefmtData>,
     pub(crate) defmt_filters: Option<Vec<(String, defmt_parser::Level)>>,
     pub(crate) color: crate::cli::ColorMode,
@@ -749,6 +759,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
     let mut state = SessionState::new();
+    state.timestamps = config.timestamps;
     state.interactive = std::io::stdout().is_terminal();
     state.channel_labels = config.up_specs.len() > 1;
     state.color = match config.color {
@@ -994,7 +1005,12 @@ mod tests {
         render_bytes(b"partial", timestamp, &mut state, &mut output).unwrap();
         render_bytes(b" line\nnext", timestamp, &mut state, &mut output).unwrap();
 
-        assert_eq!(output, b"[+   0.123s] partial line\r\n[+   0.123s] next");
+        let expected_timestamp = (state.started_wall + chrono::Duration::milliseconds(123))
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        let expected =
+            format!("[{expected_timestamp}] partial line\r\n[{expected_timestamp}] next");
+        assert_eq!(output, expected.as_bytes());
     }
 
     #[test]
@@ -1050,6 +1066,7 @@ mod tests {
             down_configured: true,
             poll_interval: Duration::from_millis(10),
             reset: false,
+            timestamps: false,
             defmt: None,
             defmt_filters: None,
             color: crate::cli::ColorMode::Never,
