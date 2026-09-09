@@ -185,7 +185,7 @@ pub(crate) struct Opts {
     )]
     pub(crate) defmt_filter: Option<String>,
 
-    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Defmt level color mode.")]
+    #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Terminal color mode for channel labels and defmt levels.")]
     pub(crate) color: ColorMode,
 
     #[clap(
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_spec_parses_all_modes() {
+    fn channel_spec_parses_ascii_and_defmt_modes() {
         assert_eq!(
             "1:ascii".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
@@ -425,16 +425,9 @@ mod tests {
             })
         );
         assert_eq!(
-            "2:ascii".parse::<ChannelSpec>(),
+            "2:defmt".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 2,
-                mode: ChannelMode::Ascii
-            })
-        );
-        assert_eq!(
-            "3:defmt".parse::<ChannelSpec>(),
-            Ok(ChannelSpec {
-                index: 3,
                 mode: ChannelMode::Defmt,
             })
         );
@@ -563,7 +556,7 @@ mod tests {
             },
             ChannelSpec {
                 index: 5,
-                mode: ChannelMode::Ascii,
+                mode: ChannelMode::Defmt,
             },
         ];
 

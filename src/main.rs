@@ -125,7 +125,6 @@ fn main() -> Result<()> {
             probe: probe_label,
             chip,
             up_specs,
-            up_configured: true,
             down_channel,
             down_configured: !opts.no_down,
             poll_interval: Duration::from_millis(opts.poll_interval),

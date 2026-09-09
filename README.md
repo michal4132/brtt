@@ -22,14 +22,14 @@ brtt [OPTIONS]
 - `--elf <PATH>`: ELF containing the defmt table; required for `:defmt` channels.
 - `--debug-defmt-table`: Print defmt table metadata and exit.
 - `--defmt-filter <SPEC>`: Filter defmt output, for example `warn` or `app=debug,warn`.
-- `--color <auto|always|never>`: Select defmt level coloring.
+- `--color <auto|always|never>`: Select terminal coloring for channel labels and defmt levels.
 - `-L, --log <PATH>`: Write session output to a log file.
 - `--log-per-channel`: Write separate `.chN` files instead of one merged log.
 - `--log-format <decoded|raw>`: Log decoded text or exact RTT bytes. Raw merged logs require a single up channel.
 
 When multiple up channels are selected, terminal output is prefixed with `[chN]`. Channel prefixes use a stable automatic color palette when color output is enabled. Log files never contain ANSI color escapes.
 
-Unsupported combinations fail before probe discovery. Defmt channels require `--elf`; `--defmt-filter` requires a defmt channel; duplicate up channels and non-raw down modes are rejected; logging modifiers require `--log`; and `--poll-interval 0` is invalid.
+Unsupported combinations fail before probe discovery. Defmt channels require `--elf`; `--defmt-filter` requires a defmt channel; duplicate up channels and `--down` with `--no-down` are rejected; logging modifiers require `--log`; and `--poll-interval 0` is invalid.
 
 During a session, press `Ctrl-T` followed by a command key:
 
