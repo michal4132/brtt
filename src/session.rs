@@ -11,9 +11,9 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use probe_rs::Core;
+use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{stdout, IsTerminal};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -441,7 +441,10 @@ fn render_ascii_chunk(
             return Ok(());
         }
         render_channel_bytes(&partial, Some(channel), timestamp, state, output)?;
-        state.foreground = Some(ForegroundLine { channel, bytes: partial });
+        state.foreground = Some(ForegroundLine {
+            channel,
+            bytes: partial,
+        });
     }
     Ok(())
 }
@@ -590,7 +593,11 @@ fn write_config(
         write!(output, " {}:{}", spec.index, spec.mode.name())?;
     }
     writeln!(output)?;
-    writeln!(output, "  Down channel: {}", config.down_channel)?;
+    if config.down_configured {
+        writeln!(output, "  Down channel: {}", config.down_channel)?;
+    } else {
+        writeln!(output, "  Down channel: disabled")?;
+    }
     writeln!(
         output,
         "  Poll interval: {} ms",
@@ -681,6 +688,7 @@ fn dispatch_command(
             output,
             None,
         )?;
+        state.foreground = Some(saved);
     }
 
     Ok(false)
@@ -690,7 +698,6 @@ pub(crate) struct SessionConfig {
     pub(crate) probe: String,
     pub(crate) chip: String,
     pub(crate) up_specs: Vec<ChannelSpec>,
-    pub(crate) up_configured: bool,
     pub(crate) down_channel: usize,
     pub(crate) down_configured: bool,
     pub(crate) poll_interval: Duration,
@@ -712,9 +719,7 @@ impl Drop for RawModeGuard {
 }
 
 pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> {
-    if config.up_configured {
-        validate_up_specs(&mut rtt, &config.up_specs)?;
-    }
+    validate_up_specs(&mut rtt, &config.up_specs)?;
     let defmt_ref = config.defmt.as_ref();
     let mut up_readers = config
         .up_specs
@@ -751,7 +756,8 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         crate::cli::ColorMode::Never => false,
         crate::cli::ColorMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
-    let stdin_setup = interactive_input_available(rtt.down_channel(config.down_channel).is_some());
+    let stdin_setup = config.down_configured
+        && interactive_input_available(rtt.down_channel(config.down_channel).is_some());
 
     let _raw_mode = if stdin_setup {
         terminal::enable_raw_mode()?;
@@ -829,17 +835,19 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
             std::thread::sleep(config.poll_interval);
         }
 
-        if let Some(down_channel) = rtt.down_channel(config.down_channel) {
-            if !down_buf.is_empty() {
-                let count = match down_channel.write(core, down_buf.as_mut()) {
-                    Ok(count) => count,
-                    Err(err) => {
-                        break 'read_loop Err(anyhow::anyhow!("\nError writing to RTT: {err}"));
-                    }
-                };
+        if config.down_configured {
+            if let Some(down_channel) = rtt.down_channel(config.down_channel) {
+                if !down_buf.is_empty() {
+                    let count = match down_channel.write(core, down_buf.as_mut()) {
+                        Ok(count) => count,
+                        Err(err) => {
+                            break 'read_loop Err(anyhow::anyhow!("\nError writing to RTT: {err}"));
+                        }
+                    };
 
-                if count > 0 {
-                    down_buf.drain(..count);
+                    if count > 0 {
+                        down_buf.drain(..count);
+                    }
                 }
             }
         }
@@ -1005,8 +1013,14 @@ mod tests {
         state.channel_labels = true;
         let mut output = Vec::new();
 
-        render_ascii_chunk(0, b"first\r\nsecond\r\n", Instant::now(), &mut state, &mut output)
-            .unwrap();
+        render_ascii_chunk(
+            0,
+            b"first\r\nsecond\r\n",
+            Instant::now(),
+            &mut state,
+            &mut output,
+        )
+        .unwrap();
 
         assert_eq!(output, b"[ch0] first\r\n[ch0] second\r\n");
     }
@@ -1032,7 +1046,6 @@ mod tests {
                 index: 2,
                 mode: ChannelMode::Ascii,
             }],
-            up_configured: true,
             down_channel: 1,
             down_configured: true,
             poll_interval: Duration::from_millis(10),
