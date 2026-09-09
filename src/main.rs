@@ -36,6 +36,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let elf_region = opts
+        .elf
+        .as_deref()
+        .map(defmt::rtt_region_from_elf)
+        .transpose()?;
+
     let lister = Lister::new();
     let probes = lister.list_all();
 
@@ -94,12 +100,21 @@ fn main() -> Result<()> {
         }
     };
 
+    let scan_region = match (elf_region, opts.scan_region) {
+        (Some(region), Some(_)) => {
+            eprintln!("Ignoring --scan-region because --elf provides _SEGGER_RTT.");
+            region
+        }
+        (Some(region), None) => region,
+        (None, Some(region)) => region,
+        (None, None) => session.target().rtt_scan_regions.clone(),
+    };
+
     let mut core = session.core(0).context("Error attaching to core # 0")?;
 
     eprintln!("Attaching to RTT...");
 
-    let mut rtt =
-        Rtt::attach_region(&mut core, &opts.scan_region).context("Error attaching to RTT")?;
+    let mut rtt = Rtt::attach_region(&mut core, &scan_region).context("Error attaching to RTT")?;
     eprintln!("Found control block at {:#010x}", rtt.ptr());
 
     if opts.list {

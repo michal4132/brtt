@@ -175,13 +175,16 @@ pub(crate) struct Opts {
 
     #[clap(
         long,
-        default_value = "",
         value_parser = parse_scan_region,
         help = "Memory region to scan for control block. You can specify either an exact starting address '0x1000' or a range such as '0x0000..0x1000'. Both decimal and hex are accepted."
     )]
-    pub(crate) scan_region: ScanRegion,
+    pub(crate) scan_region: Option<ScanRegion>,
 
-    #[clap(long, value_name = "PATH", help = "ELF containing the defmt table.")]
+    #[clap(
+        long,
+        value_name = "PATH",
+        help = "ELF containing the RTT control block symbol and, optionally, a defmt table."
+    )]
     pub(crate) elf: Option<PathBuf>,
 
     #[clap(
@@ -262,9 +265,6 @@ impl Opts {
         if self.defmt_filter.is_some() && !has_defmt {
             bail!("--defmt-filter requires at least one up channel using :defmt");
         }
-        if self.elf.is_some() && !has_defmt && !self.debug_defmt_table {
-            bail!("--elf requires an up channel using :defmt or --debug-defmt-table");
-        }
         if has_defmt && self.elf.is_none() {
             bail!("--elf is required when using an up channel with :defmt");
         }
@@ -302,7 +302,7 @@ impl Opts {
             || self.log_format.is_some()
             || self.defmt_filter.is_some()
             || self.poll_interval != 10
-            || !matches!(&self.scan_region, ScanRegion::Ram)
+            || self.scan_region.is_some()
             || self.chip.is_some()
     }
 
@@ -319,7 +319,7 @@ impl Opts {
             if matches!(self.probe, ProbeInfo::List) {
                 bail!("--list cannot be combined with --probe list");
             }
-            if self.has_session_options() || self.elf.is_some() || self.color != ColorMode::Auto {
+            if self.has_session_options() || self.color != ColorMode::Auto {
                 bail!("--list cannot be combined with session options");
             }
         }
@@ -443,7 +443,18 @@ mod tests {
 
         assert!(opts.up.is_empty());
         assert!(opts.down.is_none());
+        assert!(opts.scan_region.is_none());
         assert!(!opts.timestamps);
+    }
+
+    #[test]
+    fn opts_preserve_explicit_scan_region() {
+        let opts = Opts::try_parse_from(["brtt", "--scan-region", "0x20000000"]).unwrap();
+
+        assert!(matches!(
+            opts.scan_region,
+            Some(ScanRegion::Exact(0x20000000))
+        ));
     }
 
     #[test]
@@ -465,7 +476,7 @@ mod tests {
         assert!(validate_args(&["brtt", "--poll-interval", "0"]).is_err());
         assert!(validate_args(&["brtt", "--up", "1:defmt"]).is_err());
         assert!(validate_args(&["brtt", "--defmt-filter", "warn"]).is_err());
-        assert!(validate_args(&["brtt", "--elf", "firmware.elf"]).is_err());
+        assert!(validate_args(&["brtt", "--elf", "firmware.elf"]).is_ok());
     }
 
     #[test]

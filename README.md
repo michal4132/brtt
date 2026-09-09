@@ -20,7 +20,7 @@ brtt [OPTIONS]
 - `-t, --timestamp`: Enable local date and time timestamps with millisecond precision. `Ctrl-T t` toggles them during a session.
 - `--poll-interval <MILLISECONDS>`: Polling interval for RTT and keyboard input. [default: 10]
 - `--scan-region <SCAN_REGION>`: Specify a memory region to scan for the RTT control block. Can be an exact address (e.g., `0x20000000`) or a range (e.g., `0x20000000..0x20010000`).
-- `--elf <PATH>`: ELF containing the defmt table; required for `:defmt` channels.
+- `--elf <PATH>`: ELF containing a defined `_SEGGER_RTT` symbol and, optionally, a defmt table. Required for `:defmt` channels; its symbol takes precedence over `--scan-region`.
 - `--debug-defmt-table`: Print defmt table metadata and exit.
 - `--defmt-filter <SPEC>`: Filter defmt output, for example `warn` or `app=debug,warn`.
 - `--color <auto|always|never>`: Select terminal coloring for channel labels and defmt levels.
@@ -31,6 +31,8 @@ brtt [OPTIONS]
 When multiple up channels are selected, terminal output is prefixed with `[chN]`. Channel prefixes use a stable automatic color palette when color output is enabled. Log files never contain ANSI color escapes.
 
 Unsupported combinations fail before probe discovery. Defmt channels require `--elf`; `--defmt-filter` requires a defmt channel; duplicate up channels and `--down` with `--no-down` are rejected; logging modifiers require `--log`; and `--poll-interval 0` is invalid.
+
+When neither `--elf` nor `--scan-region` is supplied, RTT discovery uses the target-specific scan ranges from probe-rs.
 
 During a session, press `Ctrl-T` followed by a command key:
 
