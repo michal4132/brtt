@@ -148,6 +148,7 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
+        conflicts_with = "no_down",
         value_name = "CHANNEL",
         help = "Down channel specification. Only one channel is supported; defaults to channel 0."
     )]
@@ -166,6 +167,7 @@ pub(crate) struct Opts {
     #[clap(
         long,
         default_value = "10",
+        value_parser = clap::value_parser!(u64).range(1..),
         value_name = "MILLISECONDS",
         help = "Polling interval for RTT and keyboard input."
     )]
@@ -182,7 +184,11 @@ pub(crate) struct Opts {
     #[clap(long, value_name = "PATH", help = "ELF containing the defmt table.")]
     pub(crate) elf: Option<PathBuf>,
 
-    #[clap(long, help = "Print the loaded defmt table and exit.")]
+    #[clap(
+        long,
+        requires = "elf",
+        help = "Print the loaded defmt table and exit."
+    )]
     pub(crate) debug_defmt_table: bool,
 
     #[clap(
@@ -203,12 +209,13 @@ pub(crate) struct Opts {
     )]
     pub(crate) log: Option<PathBuf>,
 
-    #[clap(long, help = "Write one log file per up channel.")]
+    #[clap(long, requires = "log", help = "Write one log file per up channel.")]
     pub(crate) log_per_channel: bool,
 
     #[clap(
         long,
         value_enum,
+        requires = "log",
         help = "Log raw bytes or decoded text. Defaults to decoded."
     )]
     pub(crate) log_format: Option<LogFormat>,
@@ -232,21 +239,25 @@ pub(crate) enum LogFormat {
 
 impl Opts {
     pub(crate) fn validate(&self, up_specs: &[ChannelSpec]) -> Result<()> {
-        if self.poll_interval == 0 {
-            bail!("--poll-interval must be greater than zero");
-        }
+        self.validate_channels(up_specs)?;
+        self.validate_defmt(up_specs)?;
+        self.validate_logging(up_specs)?;
+        self.validate_operation_modes()?;
+        self.validate_filter()?;
+        Ok(())
+    }
 
+    fn validate_channels(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         let mut channels = HashSet::new();
         for spec in up_specs {
             if !channels.insert(spec.index) {
                 bail!("up channel {} was specified more than once", spec.index);
             }
         }
+        Ok(())
+    }
 
-        if self.no_down && self.down.is_some() {
-            bail!("--no-down cannot be combined with --down");
-        }
-
+    fn validate_defmt(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         let has_defmt = up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt);
         if self.defmt_filter.is_some() && !has_defmt {
             bail!("--defmt-filter requires at least one up channel using :defmt");
@@ -260,7 +271,10 @@ impl Opts {
         if self.debug_defmt_table && self.elf.is_none() {
             bail!("--debug-defmt-table requires --elf");
         }
+        Ok(())
+    }
 
+    fn validate_logging(&self, up_specs: &[ChannelSpec]) -> Result<()> {
         if self.log.is_none() {
             if self.log_per_channel {
                 bail!("--log-per-channel requires --log");
@@ -274,41 +288,30 @@ impl Opts {
         {
             bail!("--log-format raw with multiple up channels requires --log-per-channel");
         }
+        Ok(())
+    }
 
-        let session_options = || {
-            !self.up.is_empty()
-                || self.down.is_some()
-                || self.no_down
-                || self.reset
-                || self.timestamps
-                || self.log.is_some()
-                || self.log_per_channel
-                || self.log_format.is_some()
-                || self.defmt_filter.is_some()
-                || self.elf.is_some()
-                || self.poll_interval != 10
-                || !matches!(&self.scan_region, ScanRegion::Ram)
-                || self.chip.is_some()
-        };
+    fn has_session_options(&self) -> bool {
+        !self.up.is_empty()
+            || self.down.is_some()
+            || self.no_down
+            || self.reset
+            || self.timestamps
+            || self.log.is_some()
+            || self.log_per_channel
+            || self.log_format.is_some()
+            || self.defmt_filter.is_some()
+            || self.poll_interval != 10
+            || !matches!(&self.scan_region, ScanRegion::Ram)
+            || self.chip.is_some()
+    }
+
+    fn validate_operation_modes(&self) -> Result<()> {
         if self.debug_defmt_table {
             if self.list || matches!(self.probe, ProbeInfo::List) {
                 bail!("--debug-defmt-table cannot be combined with --list or --probe list");
             }
-            if session_options()
-                && (!self.up.is_empty()
-                    || self.down.is_some()
-                    || self.no_down
-                    || self.reset
-                    || self.timestamps
-                    || self.log.is_some()
-                    || self.log_per_channel
-                    || self.log_format.is_some()
-                    || self.defmt_filter.is_some()
-                    || self.poll_interval != 10
-                    || !matches!(&self.scan_region, ScanRegion::Ram)
-                    || self.chip.is_some()
-                    || self.color != ColorMode::Auto)
-            {
+            if self.has_session_options() || self.color != ColorMode::Auto {
                 bail!("--debug-defmt-table cannot be combined with session options");
             }
         }
@@ -316,46 +319,24 @@ impl Opts {
             if matches!(self.probe, ProbeInfo::List) {
                 bail!("--list cannot be combined with --probe list");
             }
-            if !self.up.is_empty()
-                || self.down.is_some()
-                || self.no_down
-                || self.reset
-                || self.timestamps
-                || self.log.is_some()
-                || self.log_per_channel
-                || self.log_format.is_some()
-                || self.defmt_filter.is_some()
-                || self.elf.is_some()
-                || self.poll_interval != 10
-                || !matches!(&self.scan_region, ScanRegion::Ram)
-                || self.chip.is_some()
-                || self.color != ColorMode::Auto
-            {
+            if self.has_session_options() || self.elf.is_some() || self.color != ColorMode::Auto {
                 bail!("--list cannot be combined with session options");
             }
         }
         if matches!(self.probe, ProbeInfo::List)
             && (self.list
-                || !self.up.is_empty()
-                || self.down.is_some()
-                || self.no_down
-                || self.reset
-                || self.timestamps
-                || self.log.is_some()
-                || self.log_per_channel
-                || self.log_format.is_some()
-                || self.defmt_filter.is_some()
+                || self.has_session_options()
                 || self.elf.is_some()
-                || self.poll_interval != 10
-                || !matches!(&self.scan_region, ScanRegion::Ram)
-                || self.chip.is_some()
                 || self.color != ColorMode::Auto)
         {
             bail!("--probe list cannot be combined with session options");
         }
+        Ok(())
+    }
 
+    fn validate_filter(&self) -> Result<()> {
         if let Some(filter) = self.defmt_filter.as_deref() {
-            let parsed = crate_filter_spec(filter)?;
+            let parsed = crate::defmt::parse_filter_spec(filter)?;
             let mut prefixes = HashSet::new();
             for (prefix, _) in parsed {
                 if !prefixes.insert(prefix.clone()) {
@@ -368,35 +349,6 @@ impl Opts {
         }
         Ok(())
     }
-}
-
-fn crate_filter_spec(spec: &str) -> Result<Vec<(String, defmt_parser::Level)>> {
-    let mut result = Vec::new();
-    for item in spec.split(',').filter(|item| !item.trim().is_empty()) {
-        let (module, level) = item.split_once('=').unwrap_or(("", item));
-        if module.contains(char::is_whitespace) {
-            bail!(
-                "invalid defmt filter module '{}': whitespace is not allowed",
-                module
-            );
-        }
-        let level = match level.trim().to_ascii_lowercase().as_str() {
-            "trace" => defmt_parser::Level::Trace,
-            "debug" => defmt_parser::Level::Debug,
-            "info" => defmt_parser::Level::Info,
-            "warn" | "warning" => defmt_parser::Level::Warn,
-            "error" => defmt_parser::Level::Error,
-            value => bail!(
-                "invalid defmt level '{}', expected trace, debug, info, warn, or error",
-                value
-            ),
-        };
-        result.push((module.to_string(), level));
-    }
-    if result.is_empty() {
-        bail!("defmt filter cannot be empty");
-    }
-    Ok(result)
 }
 
 pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
