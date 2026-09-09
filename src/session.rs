@@ -63,6 +63,8 @@ struct SessionState {
     color: bool,
     channel_labels: bool,
     last_channel: Option<u32>,
+    line_channel: Option<u32>,
+    line_bytes: Vec<u8>,
 }
 
 impl SessionState {
@@ -76,6 +78,8 @@ impl SessionState {
             color: false,
             channel_labels: false,
             last_channel: None,
+            line_channel: None,
+            line_bytes: Vec::new(),
         }
     }
 }
@@ -302,8 +306,77 @@ fn render_channel_bytes_colored(
     timestamp: Instant,
     state: &mut SessionState,
     output: &mut impl Write,
-    line_color: Option<&str>,
+    line_color: Option<&'static str>,
 ) -> std::io::Result<()> {
+    let suspended = if !state.line_start && state.line_channel != channel_idx {
+        let saved = PartialLine {
+            bytes: std::mem::take(&mut state.line_bytes),
+            channel_idx: state.line_channel.or(state.last_channel),
+            timestamp: Instant::now(),
+        };
+        output.write_all(b"\r\x1b[2K")?;
+        state.line_start = true;
+        state.line_channel = None;
+        state.last_channel = None;
+        Some(saved)
+    } else {
+        None
+    };
+
+    render_channel_bytes_colored_inner(bytes, channel_idx, timestamp, state, output, line_color)?;
+
+    if let Some(saved) = suspended {
+        state.line_start = true;
+        state.last_channel = None;
+        render_channel_bytes_colored_inner(
+            &saved.bytes,
+            saved.channel_idx,
+            saved.timestamp,
+            state,
+            output,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+struct PartialLine {
+    bytes: Vec<u8>,
+    channel_idx: Option<u32>,
+    timestamp: Instant,
+}
+
+fn suspend_partial_line(
+    state: &mut SessionState,
+    output: &mut impl Write,
+) -> std::io::Result<Option<PartialLine>> {
+    if state.line_start {
+        return Ok(None);
+    }
+
+    let saved = PartialLine {
+        bytes: std::mem::take(&mut state.line_bytes),
+        channel_idx: state.line_channel.or(state.last_channel),
+        timestamp: Instant::now(),
+    };
+    output.write_all(b"\r\x1b[2K")?;
+    state.line_start = true;
+    state.line_channel = None;
+    state.last_channel = None;
+    Ok(Some(saved))
+}
+
+fn render_channel_bytes_colored_inner(
+    bytes: &[u8],
+    channel_idx: Option<u32>,
+    timestamp: Instant,
+    state: &mut SessionState,
+    output: &mut impl Write,
+    line_color: Option<&'static str>,
+) -> std::io::Result<()> {
+    if !bytes.is_empty() {
+        state.line_channel = channel_idx;
+    }
     for &byte in bytes {
         let line_start = state.line_start;
         let channel_switch =
@@ -345,6 +418,12 @@ fn render_channel_bytes_colored(
             state.line_start = false;
         }
         output.write_all(&[byte])?;
+        if byte != b'\n' {
+            state.line_bytes.push(byte);
+        } else {
+            state.line_bytes.clear();
+            state.line_channel = None;
+        }
         if byte == b'\n' && line_color.is_some() {
             output.write_all(b"\x1b[0m")?;
         }
@@ -469,15 +548,10 @@ fn io_error(error: anyhow::Error) -> std::io::Error {
 }
 
 fn write_help(output: &mut impl Write) -> std::io::Result<()> {
-    writeln!(output, "\r\nCtrl-T commands:")?;
-    writeln!(output, "  q  Quit")?;
-    writeln!(output, "  ?  Show this help")?;
-    writeln!(output, "  c  Show configuration")?;
-    writeln!(output, "  l  Clear screen")?;
-    writeln!(output, "  t  Toggle timestamps")?;
-    writeln!(output, "  e  Toggle local echo")?;
-    writeln!(output, "  R  Reset target")?;
-    writeln!(output, "  Ctrl-T  Send a literal Ctrl-T")?;
+    write!(
+        output,
+        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  e  Toggle local echo\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n"
+    )?;
     output.flush()
 }
 
@@ -534,8 +608,12 @@ fn dispatch_command(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> Result<bool> {
+    if command == SessionCommand::Quit {
+        return Ok(true);
+    }
+    let suspended = suspend_partial_line(state, output)?;
     match command {
-        SessionCommand::Quit => return Ok(true),
+        SessionCommand::Quit => unreachable!("quit handled before rendering command output"),
         SessionCommand::Help => {
             write_help(output)?;
             state.line_start = true;
@@ -568,6 +646,19 @@ fn dispatch_command(
             output.flush()?;
             state.line_start = true;
         }
+    }
+
+    if let Some(saved) = suspended {
+        state.line_start = true;
+        state.last_channel = None;
+        render_channel_bytes_colored_inner(
+            &saved.bytes,
+            saved.channel_idx,
+            saved.timestamp,
+            state,
+            output,
+            None,
+        )?;
     }
 
     Ok(false)
@@ -973,7 +1064,10 @@ mod tests {
 
         render_events(&events, &mut state, None, None, &mut output).unwrap();
 
-        assert_eq!(output, b"[ch0] zero\r\n[ch0] one[ch1] one\r\n");
+        assert_eq!(
+            output,
+            b"[ch0] zero\r\n[ch0] one\r\x1b[2K[ch1] one\r\n[ch0] one"
+        );
     }
 
     #[test]
