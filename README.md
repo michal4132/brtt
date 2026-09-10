@@ -34,6 +34,27 @@ Unsupported combinations fail before probe discovery. Defmt channels require `--
 
 When neither `--elf` nor `--scan-region` is supplied, RTT discovery uses the target-specific scan ranges from probe-rs.
 
+## Nix
+
+The flake provides a reproducible source build for the supported Unix systems.
+
+Install the latest package directly:
+
+```sh
+nix profile install github:michal4132/brtt
+```
+
+Use it from another flake without writing a derivation:
+
+```nix
+inputs.brtt.url = "github:michal4132/brtt";
+
+# Use inputs.brtt.packages.${system}.default in a package list.
+```
+
+The flake also exports `overlays.default` for users who prefer
+`pkgs.brtt` after adding the overlay to their nixpkgs import.
+
 During a session, press `Ctrl-T` followed by a command key:
 
 - `q`: Quit.
