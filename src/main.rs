@@ -3,7 +3,7 @@ mod defmt;
 mod logger;
 mod session;
 
-use brtt::rtt::Rtt;
+use brtt::rtt::{attach_region_incremental, Rtt};
 use brtt::RttChannel;
 
 use anyhow::{bail, Context, Result};
@@ -103,6 +103,7 @@ fn main() -> Result<()> {
         }
     };
 
+    let automatic_scan = elf_region.is_none() && opts.scan_region.is_none();
     let scan_region = match (elf_region, opts.scan_region) {
         (Some(region), Some(_)) => {
             eprintln!("Ignoring --scan-region because --elf provides _SEGGER_RTT.");
@@ -112,14 +113,18 @@ fn main() -> Result<()> {
         (None, Some(region)) => region,
         (None, None) => session.target().rtt_scan_regions.clone(),
     };
-
     let mut core = session.core(0).context("Error attaching to core #0")?;
 
     ensure_supported_target(core.is_64_bit())?;
 
     eprintln!("Attaching to RTT...");
 
-    let mut rtt = Rtt::attach_region(&mut core, &scan_region).context("Error attaching to RTT")?;
+    let mut rtt = if automatic_scan {
+        attach_region_incremental(&mut core, &scan_region)
+    } else {
+        Rtt::attach_region(&mut core, &scan_region)
+    }
+    .context("Error attaching to RTT")?;
     eprintln!("Found control block at {:#010x}", rtt.ptr());
 
     if opts.list {
@@ -157,6 +162,7 @@ fn main() -> Result<()> {
             log_per_channel: opts.log_per_channel,
             log_format: opts.log_format.unwrap_or(cli::LogFormat::Decoded),
             scan_region,
+            automatic_scan,
         },
     )
 }

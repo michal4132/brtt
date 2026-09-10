@@ -4,7 +4,7 @@ use crate::defmt::{
 };
 use crate::logger::Logger;
 use anyhow::{bail, Context, Result};
-use brtt::rtt::{try_attach_to_rtt, Rtt, ScanRegion};
+use brtt::rtt::{try_attach_to_rtt, try_attach_to_rtt_incremental, Rtt, ScanRegion};
 use brtt::RttChannel;
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -256,14 +256,23 @@ fn validate_channels(rtt: &mut Rtt, config: &SessionConfig) -> Result<()> {
     Ok(())
 }
 
-fn reset_and_reattach(core: &mut Core, rtt: &mut Rtt, scan_region: &ScanRegion) -> Result<()> {
+fn reset_and_reattach(
+    core: &mut Core,
+    rtt: &mut Rtt,
+    scan_region: &ScanRegion,
+    automatic_scan: bool,
+) -> Result<()> {
     core.halt(TARGET_HALT_TIMEOUT)
         .context("Error halting target before reset")?;
     Rtt::clear_control_block(core, &ScanRegion::Exact(rtt.ptr()))
         .context("Error clearing stale RTT control block before reset")?;
     core.reset().context("Error resetting target")?;
-    *rtt = try_attach_to_rtt(core, RTT_REATTACH_TIMEOUT, scan_region)
-        .context("Error reattaching to RTT after target reset")?;
+    *rtt = if automatic_scan {
+        try_attach_to_rtt_incremental(core, RTT_REATTACH_TIMEOUT, scan_region)
+    } else {
+        try_attach_to_rtt(core, RTT_REATTACH_TIMEOUT, scan_region)
+    }
+    .context("Error reattaching to RTT after target reset")?;
     Ok(())
 }
 
@@ -740,7 +749,7 @@ fn dispatch_command<'table>(
             state.line_start = true;
         }
         SessionCommand::ResetTarget => {
-            reset_and_reattach(core, rtt, &config.scan_region)?;
+            reset_and_reattach(core, rtt, &config.scan_region, config.automatic_scan)?;
             validate_channels(rtt, config)?;
             for reader in up_readers {
                 reader.reset(config.defmt.as_ref())?;
@@ -784,6 +793,7 @@ pub(crate) struct SessionConfig {
     pub(crate) log_per_channel: bool,
     pub(crate) log_format: crate::cli::LogFormat,
     pub(crate) scan_region: ScanRegion,
+    pub(crate) automatic_scan: bool,
 }
 
 struct RawModeGuard;
@@ -796,7 +806,7 @@ impl Drop for RawModeGuard {
 
 pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> {
     if config.reset {
-        reset_and_reattach(core, &mut rtt, &config.scan_region)?;
+        reset_and_reattach(core, &mut rtt, &config.scan_region, config.automatic_scan)?;
     }
 
     validate_channels(&mut rtt, &config)?;
@@ -1277,6 +1287,7 @@ mod tests {
             log_per_channel: false,
             log_format: crate::cli::LogFormat::Decoded,
             scan_region: ScanRegion::Exact(0x2000_0000),
+            automatic_scan: false,
         };
         let state = SessionState::new();
         let mut output = Vec::new();
