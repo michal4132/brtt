@@ -35,14 +35,11 @@ brtt [OPTIONS]
 This monitors the ASCII terminal on channel 0 and defmt output on channel 1:
 
 ```sh
-cargo run --release -- \
-  --probe 0 \
+brtt --release -- \
   --chip nRF54L15 \
-  --scan-region 0x20002e68 \
   --up 0:ascii \
   --up 1:defmt \
-  --no-down \
-  --elf "/home/kruppenfield/Programowanie/zephyr_vs_embassy/rust-template/target/thumbv8m.main-none-eabihf/release/application"
+  --elf "path/to/elf"
 ```
 
 When multiple up channels are selected, terminal output is prefixed with `[chN]`. Channel prefixes use a stable automatic color palette when color output is enabled. Log files never contain ANSI color escapes.
@@ -88,11 +85,3 @@ During a session, press `Ctrl-T` followed by a command key:
 - `e`: Toggle local echo.
 - `R`: Reset the target.
 - `Ctrl-T`: Send a literal `Ctrl-T` to the down channel.
-
-The session prints `Press ctrl-t ? for help` after connecting. `Ctrl-C` is sent
-to the target as byte `0x03`; use `Ctrl-T q` to quit `brtt`.
-
-Unlike `tio`, `brtt` does not implement serial-port settings or serial-device
-discovery/reconnect, input/output hex modes, output delays, character mapping,
-scripts, socket/exec redirection, RS-485, connect alerts, or tio-specific log
-file options. These features do not apply to an RTT debug session.
