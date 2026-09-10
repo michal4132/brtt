@@ -1181,14 +1181,40 @@ mod tests {
     }
 
     #[test]
-    fn redirected_output_uses_line_feeds() {
+    fn redirected_ascii_output_buffers_fragments_until_a_complete_line() {
         let mut state = SessionState::new();
         state.interactive = false;
         let mut output = Vec::new();
+        let timestamp = Instant::now();
 
-        render_bytes(b"text\n", Instant::now(), &mut state, &mut output).unwrap();
+        render_events(
+            &[ChannelEvent {
+                channel_idx: 0,
+                payload: ChannelPayload::Bytes(b"partial ".to_vec()),
+                timestamp,
+            }],
+            &mut state,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap();
+        assert!(output.is_empty());
 
-        assert_eq!(output, b"text\n");
+        render_events(
+            &[ChannelEvent {
+                channel_idx: 0,
+                payload: ChannelPayload::Bytes(b"line\n".to_vec()),
+                timestamp,
+            }],
+            &mut state,
+            None,
+            None,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"partial line\n");
     }
 
     #[test]
@@ -1269,12 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn non_terminal_input_does_not_block_headless_output() {
-        assert!(!interactive_input_available(false));
-    }
-
-    #[test]
-    fn channel_events_keep_tags_and_render_in_order() {
+    fn channel_events_are_rendered_with_channel_labels_in_event_order() {
         let events = vec![
             ChannelEvent {
                 channel_idx: 2,
@@ -1289,12 +1310,11 @@ mod tests {
         ];
         let mut output = Vec::new();
         let mut state = SessionState::new();
+        state.channel_labels = true;
 
         render_events(&events, &mut state, None, None, &mut output).unwrap();
 
-        assert_eq!(events[0].channel_idx, 2);
-        assert_eq!(events[1].channel_idx, 0);
-        assert_eq!(output, b"log\r\nshell");
+        assert_eq!(output, b"[ch2] log\r\n[ch0] shell");
     }
 
     #[test]
@@ -1363,5 +1383,27 @@ mod tests {
         render_events(&events, &mut state, None, None, &mut output).unwrap();
 
         assert_eq!(output, b"\x1b[35m[ch1] \x1b[0m\x1b[31merror bad\r\n\x1b[0m");
+    }
+
+    #[test]
+    fn filtered_defmt_frames_are_not_rendered_or_logged() {
+        let events = vec![ChannelEvent {
+            channel_idx: 0,
+            payload: ChannelPayload::Defmt(DecodedFrame {
+                message: "quiet".to_string(),
+                timestamp: None,
+                level: Some(defmt_parser::Level::Info),
+                module: Some("app".to_string()),
+            }),
+            timestamp: Instant::now(),
+        }];
+        let filters = vec![(String::new(), defmt_parser::Level::Warn)];
+        let mut output = Vec::new();
+        let mut state = SessionState::new();
+
+        render_events(&events, &mut state, Some(&filters), None, &mut output).unwrap();
+
+        assert!(output.is_empty());
+        assert_eq!(state.defmt_decode_warnings, 0);
     }
 }

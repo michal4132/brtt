@@ -219,4 +219,31 @@ mod tests {
         assert_eq!(fs::read(&channel_path).unwrap(), &[0, 1, 0xff]);
         fs::remove_file(channel_path).unwrap();
     }
+
+    #[test]
+    fn per_channel_decoded_logs_do_not_need_channel_tags() {
+        let path = test_path("decoded-per-channel.log");
+        let mut logger = Logger::new(Some(&path), true, LogFormat::Decoded, 2)
+            .unwrap()
+            .unwrap();
+        logger.write_decoded(1, b"message\n", false).unwrap();
+        logger.flush().unwrap();
+
+        let channel_path = channel_path(&path, 1);
+        assert_eq!(fs::read(&channel_path).unwrap(), b"message\n");
+        fs::remove_file(channel_path).unwrap();
+    }
+
+    #[test]
+    fn decoded_logger_flushes_an_unfinished_line() {
+        let path = test_path("decoded-tail");
+        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
+            .unwrap()
+            .unwrap();
+        logger.write_decoded(0, b"unfinished", false).unwrap();
+        logger.flush().unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"unfinished");
+        fs::remove_file(path).unwrap();
+    }
 }

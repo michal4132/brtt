@@ -307,8 +307,6 @@ impl Opts {
             || self.log_format.is_some()
             || self.defmt_filter.is_some()
             || self.poll_interval != 10
-            || self.scan_region.is_some()
-            || self.chip.is_some()
     }
 
     fn validate_operation_modes(&self) -> Result<()> {
@@ -329,10 +327,7 @@ impl Opts {
             }
         }
         if matches!(self.probe, Some(ProbeInfo::List))
-            && (self.list
-                || self.has_session_options()
-                || self.elf.is_some()
-                || self.color != ColorMode::Auto)
+            && (self.list || self.has_session_options() || self.color != ColorMode::Auto)
         {
             bail!("--probe list cannot be combined with session options");
         }
@@ -489,34 +484,63 @@ mod tests {
         opts.validate(&specs).map_err(|error| error.to_string())
     }
 
+    fn assert_error_contains(args: &[&str], expected: &str) {
+        let error = validate_args(args).expect_err("arguments unexpectedly accepted");
+        assert!(
+            error.contains(expected),
+            "{error:?} does not contain {expected:?}"
+        );
+    }
+
     #[test]
     fn validation_rejects_unsupported_channel_combinations() {
-        assert!(validate_args(&["brtt", "--up", "0", "--up", "0"]).is_err());
-        assert!(validate_args(&["brtt", "--poll-interval", "0"]).is_err());
-        assert!(validate_args(&["brtt", "--up", "1:defmt"]).is_err());
-        assert!(validate_args(&["brtt", "--defmt-filter", "warn"]).is_err());
+        assert_error_contains(
+            &["brtt", "--up", "0", "--up", "0"],
+            "specified more than once",
+        );
+        assert_error_contains(&["brtt", "--poll-interval", "0"], "not in 1..");
+        assert_error_contains(&["brtt", "--up", "1:defmt"], "--elf is required");
+        assert_error_contains(
+            &["brtt", "--defmt-filter", "warn"],
+            "requires at least one up channel",
+        );
         assert!(validate_args(&["brtt", "--elf", "firmware.elf"]).is_ok());
     }
 
     #[test]
     fn validation_rejects_log_modifiers_without_a_log() {
-        assert!(validate_args(&["brtt", "--log-per-channel"]).is_err());
-        assert!(validate_args(&["brtt", "--log-format", "raw"]).is_err());
+        assert_error_contains(&["brtt", "--log-per-channel"], "--log <PATH>");
+        assert_error_contains(&["brtt", "--log-format", "raw"], "--log <PATH>");
     }
 
     #[test]
     fn validation_rejects_conflicting_exit_modes() {
-        assert!(validate_args(&["brtt", "--list", "--up", "0"]).is_err());
-        assert!(validate_args(&["brtt", "--probe", "list", "--reset"]).is_err());
-        assert!(validate_args(&["brtt", "--debug-defmt-table"]).is_err());
-        assert!(validate_args(&[
-            "brtt",
-            "--debug-defmt-table",
-            "--elf",
-            "firmware.elf",
-            "--list"
-        ])
-        .is_err());
+        assert_error_contains(
+            &["brtt", "--list", "--up", "0"],
+            "--list cannot be combined",
+        );
+        assert_error_contains(
+            &["brtt", "--probe", "list", "--reset"],
+            "--probe list cannot be combined",
+        );
+        assert_error_contains(&["brtt", "--debug-defmt-table"], "--elf <PATH>");
+        assert_error_contains(
+            &[
+                "brtt",
+                "--debug-defmt-table",
+                "--elf",
+                "firmware.elf",
+                "--list",
+            ],
+            "cannot be combined",
+        );
+    }
+
+    #[test]
+    fn list_accepts_target_discovery_options() {
+        assert!(validate_args(&["brtt", "--list", "--chip", "nRF54L15"]).is_ok());
+        assert!(validate_args(&["brtt", "--list", "--scan-region", "0x20002e68"]).is_ok());
+        assert!(validate_args(&["brtt", "--list", "--elf", "firmware.elf"]).is_ok());
     }
 
     #[test]
