@@ -24,27 +24,27 @@ impl std::str::FromStr for ProbeInfo {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum ChannelMode {
+pub(crate) enum ChannelEncoding {
     Ascii,
     Defmt,
 }
 
-impl ChannelMode {
+impl ChannelEncoding {
     pub(crate) fn name(self) -> &'static str {
         match self {
-            ChannelMode::Ascii => "ascii",
-            ChannelMode::Defmt => "defmt",
+            ChannelEncoding::Ascii => "ascii",
+            ChannelEncoding::Defmt => "defmt",
         }
     }
 }
 
-impl std::str::FromStr for ChannelMode {
+impl std::str::FromStr for ChannelEncoding {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "ascii" => Ok(ChannelMode::Ascii),
-            "defmt" => Ok(ChannelMode::Defmt),
+            "ascii" => Ok(ChannelEncoding::Ascii),
+            "defmt" => Ok(ChannelEncoding::Defmt),
             _ => Err(format!(
                 "invalid channel mode '{value}', expected ascii or defmt"
             )),
@@ -55,7 +55,7 @@ impl std::str::FromStr for ChannelMode {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct ChannelSpec {
     pub(crate) index: u32,
-    pub(crate) mode: ChannelMode,
+    pub(crate) mode: ChannelEncoding,
 }
 
 impl std::str::FromStr for ChannelSpec {
@@ -106,7 +106,11 @@ pub(crate) fn parse_scan_region(
 
     match *parts.as_slice() {
         [addr] => Ok(ScanRegion::Exact(addr)),
-        [start, end] => Ok(ScanRegion::range(start..end)),
+        [start, end] if start < end => Ok(ScanRegion::range(start..end)),
+        [start, end] => Err(format!(
+            "invalid scan range '{src}': start {start:#x} must be less than end {end:#x}"
+        )
+        .into()),
         _ => Err("Invalid range: multiple '..'s".into()),
     }
 }
@@ -260,7 +264,9 @@ impl Opts {
     }
 
     fn validate_defmt(&self, up_specs: &[ChannelSpec]) -> Result<()> {
-        let has_defmt = up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt);
+        let has_defmt = up_specs
+            .iter()
+            .any(|spec| spec.mode == ChannelEncoding::Defmt);
         if self.defmt_filter.is_some() && !has_defmt {
             bail!("--defmt-filter requires at least one up channel using :defmt");
         }
@@ -354,7 +360,7 @@ pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     if specs.is_empty() {
         vec![ChannelSpec {
             index: 0,
-            mode: ChannelMode::Ascii,
+            mode: ChannelEncoding::Ascii,
         }]
     } else {
         specs.to_vec()
@@ -372,7 +378,7 @@ mod tests {
             "7".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 7,
-                mode: ChannelMode::Ascii,
+                mode: ChannelEncoding::Ascii,
             })
         );
     }
@@ -383,14 +389,14 @@ mod tests {
             "1:ascii".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 1,
-                mode: ChannelMode::Ascii,
+                mode: ChannelEncoding::Ascii,
             })
         );
         assert_eq!(
             "2:defmt".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 2,
-                mode: ChannelMode::Defmt,
+                mode: ChannelEncoding::Defmt,
             })
         );
     }
@@ -411,7 +417,7 @@ mod tests {
             "4294967295".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: u32::MAX,
-                mode: ChannelMode::Ascii,
+                mode: ChannelEncoding::Ascii,
             })
         );
     }
@@ -425,11 +431,11 @@ mod tests {
             vec![
                 ChannelSpec {
                     index: 3,
-                    mode: ChannelMode::Ascii,
+                    mode: ChannelEncoding::Ascii,
                 },
                 ChannelSpec {
                     index: 4,
-                    mode: ChannelMode::Ascii,
+                    mode: ChannelEncoding::Ascii,
                 },
             ]
         );
@@ -455,6 +461,12 @@ mod tests {
             opts.scan_region,
             Some(ScanRegion::Exact(0x20000000))
         ));
+    }
+
+    #[test]
+    fn scan_region_rejects_empty_and_reversed_ranges() {
+        assert!(parse_scan_region("0x2000..0x2000").is_err());
+        assert!(parse_scan_region("0x3000..0x2000").is_err());
     }
 
     #[test]
@@ -531,7 +543,7 @@ mod tests {
             configured_up_specs(&[]),
             vec![ChannelSpec {
                 index: 0,
-                mode: ChannelMode::Ascii,
+                mode: ChannelEncoding::Ascii,
             }]
         );
     }
@@ -541,11 +553,11 @@ mod tests {
         let specs = vec![
             ChannelSpec {
                 index: 2,
-                mode: ChannelMode::Ascii,
+                mode: ChannelEncoding::Ascii,
             },
             ChannelSpec {
                 index: 5,
-                mode: ChannelMode::Defmt,
+                mode: ChannelEncoding::Defmt,
             },
         ];
 

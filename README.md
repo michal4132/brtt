@@ -10,7 +10,7 @@ brtt [OPTIONS]
 
 ### Options
 
-- `-p, --probe <PROBE>`: Specify the probe number. Use `list` to see all available probes. [default: 0]
+- `-p, --probe <PROBE>`: Specify the probe number. Use `list` to see all available probes. A single available probe is selected automatically; multiple probes prompt for a selection.
 - `-c, --chip <CHIP>`: Specify the target chip type (e.g., `nRF52840_xxAA`). If not provided, `brtt` will attempt to auto-detect it.
 - `-l, --list`: List available RTT up and down channels on the target and exit.
 - `-u, --up <CHANNEL[:MODE]>`: The RTT "up" channel (target to host) to use. `MODE` can be `ascii` or `defmt` and defaults to `ascii`. Defaults to channel 0 and may be repeated.
@@ -33,6 +33,10 @@ When multiple up channels are selected, terminal output is prefixed with `[chN]`
 Unsupported combinations fail before probe discovery. Defmt channels require `--elf`; `--defmt-filter` requires a defmt channel; duplicate up channels and `--down` with `--no-down` are rejected; logging modifiers require `--log`; and `--poll-interval 0` is invalid.
 
 When neither `--elf` nor `--scan-region` is supplied, RTT discovery uses the target-specific scan ranges from probe-rs.
+
+Internal diagnostics are written to stderr and warnings are shown by default. Set `RUST_LOG=brtt=debug` or `RUST_LOG=brtt=trace` to see additional discovery details. RTT channel data remains on stdout.
+
+Defmt filters apply only to frames already sent by the target. A module-specific filter changes that module while leaving other modules unchanged: `app=debug` shows debug-or-higher messages from `app` and leaves other modules at their normal level. Use `warn,app=debug` for a warning threshold globally with a more verbose `app` override.
 
 ## Nix
 

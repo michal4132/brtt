@@ -5,16 +5,14 @@
 //! blocking, making it usable even in real-time applications where e.g. semihosting delays cannot
 //! be tolerated.
 //!
-//! This crate enables you to read and write via RTT channels. It's also used as a building-block
-//! for probe-rs debugging tools.
+//! This module enables the brtt CLI to read and write via RTT channels.
 //!
 //! ## Example
 //!
 //! ```no_run
 //! use probe_rs::probe::list::Lister;
 //! use probe_rs::Permissions;
-//! use probe_rs::rtt::Rtt;
-//! # async_io::block_on(async {
+//! use brtt::rtt::Rtt;
 //!
 //! // First obtain a probe-rs session (see probe-rs documentation for details)
 //! let lister = Lister::new();
@@ -43,7 +41,6 @@
 //! }
 //!
 //! # Ok::<(), Box<dyn std::error::Error>>(())
-//! # });
 //! ```
 
 use crate::channel::{Channel, DownChannel, RttChannelBuffer, RttChannelBufferInner, UpChannel};
@@ -256,7 +253,7 @@ impl Rtt {
         // Validate that the control block starts with the ID bytes
         let rtt_id = rtt_header.id();
         if rtt_id != Self::RTT_ID {
-            tracing::trace!(
+            log::trace!(
                 "Expected control block to start with RTT ID: {:?}\n. Got instead: {:?}",
                 String::from_utf8_lossy(&Self::RTT_ID),
                 String::from_utf8_lossy(&rtt_id)
@@ -301,7 +298,7 @@ impl Rtt {
             if let Some(chan) = Channel::from(core, channel_index, offset, buffer)? {
                 up_channels.push(UpChannel(chan));
             } else {
-                tracing::warn!("Buffer for up channel {channel_index} not initialized");
+                log::warn!("Buffer for up channel {channel_index} not initialized");
             }
             offset += buffer_size;
         }
@@ -313,7 +310,7 @@ impl Rtt {
             if let Some(chan) = Channel::from(core, channel_index, offset, buffer)? {
                 down_channels.push(DownChannel(chan));
             } else {
-                tracing::warn!("Buffer for down channel {channel_index} not initialized");
+                log::warn!("Buffer for down channel {channel_index} not initialized");
             }
             offset += buffer_size;
         }
@@ -328,7 +325,7 @@ impl Rtt {
     /// Attempts to detect an RTT control block in the specified RAM region(s) and returns an
     /// instance if a valid control block was found.
     pub fn attach_region(core: &mut Core, region: &ScanRegion) -> Result<Rtt, Error> {
-        let ptr = Self::find_contol_block(core, region)?;
+        let ptr = Self::find_control_block(core, region)?;
         Self::attach_at(core, ptr)
     }
 
@@ -340,15 +337,15 @@ impl Rtt {
 
     /// Attempts to detect an RTT control block in the specified RAM region(s) and returns an
     /// address if a valid control block location was found.
-    pub fn find_contol_block(core: &mut Core, region: &ScanRegion) -> Result<u64, Error> {
+    pub fn find_control_block(core: &mut Core, region: &ScanRegion) -> Result<u64, Error> {
         let ranges = match region.clone() {
             ScanRegion::Exact(addr) => {
-                tracing::debug!("Scanning at exact address: {:#010x}", addr);
+                log::debug!("Scanning at exact address: {:#010x}", addr);
 
                 return Ok(addr);
             }
             ScanRegion::Ram => {
-                tracing::debug!("Scanning whole RAM");
+                log::debug!("Scanning whole RAM");
 
                 core.memory_regions()
                     .filter_map(MemoryRegion::as_ram_region)
@@ -357,13 +354,13 @@ impl Rtt {
             }
             ScanRegion::Ranges(regions) if regions.is_empty() => {
                 // We have no regions to scan so we cannot initialize RTT.
-                tracing::debug!(
+                log::debug!(
                     "ELF file has no RTT block symbol, and this target does not support automatic scanning"
                 );
                 return Err(Error::NoControlBlockLocation);
             }
             ScanRegion::Ranges(regions) => {
-                tracing::debug!("Scanning regions: {:#010x?}", region);
+                log::debug!("Scanning regions: {:#010x?}", region);
                 regions
             }
         };
@@ -377,7 +374,7 @@ impl Rtt {
                     // won't consider a >4GiB region if probe-rs is running
                     // on a 32-bit host, but it would be relatively unusual
                     // to use a 32-bit host to debug a 64-bit target.
-                    tracing::warn!("Region too long ({} bytes), ignoring", range_len);
+                    log::warn!("Region too long ({} bytes), ignoring", range_len);
                     return None;
                 };
 
@@ -500,13 +497,13 @@ fn try_attach_to_rtt_inner(
     let t = Instant::now();
     let mut attempt = 1;
     loop {
-        tracing::debug!("Initializing RTT (attempt {attempt})...");
+        log::debug!("Initializing RTT (attempt {attempt})...");
 
         match try_attach_once() {
             err @ Err(Error::NoControlBlockLocation) => return err,
             Err(_) if t.elapsed() < timeout => {
                 attempt += 1;
-                tracing::debug!("Failed to initialize RTT. Retrying until timeout.");
+                log::debug!("Failed to initialize RTT. Retrying until timeout.");
                 thread::sleep(Duration::from_millis(50));
             }
             other => return other,

@@ -8,14 +8,16 @@ use brtt::rtt::Rtt;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use cli::{configured_up_specs, ChannelMode, Opts, ProbeInfo};
+use cli::{configured_up_specs, ChannelEncoding, Opts, ProbeInfo};
 use probe_rs::{config::TargetSelector, probe::list::Lister, probe::DebugProbeInfo, Permissions};
 use session::{run_session, SessionConfig};
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
 fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brtt=warn"))
+        .format(|buffer, record| writeln!(buffer, "[brtt {}] {}", record.level(), record.args()))
+        .init();
     let opts = Opts::parse();
 
     let up_specs = configured_up_specs(&opts.up);
@@ -27,7 +29,10 @@ fn main() -> Result<()> {
         .transpose()?;
     let defmt_data = defmt::require_elf(
         opts.elf.as_deref(),
-        opts.debug_defmt_table || up_specs.iter().any(|spec| spec.mode == ChannelMode::Defmt),
+        opts.debug_defmt_table
+            || up_specs
+                .iter()
+                .any(|spec| spec.mode == ChannelEncoding::Defmt),
     )?;
     if opts.debug_defmt_table {
         let data = defmt_data.as_ref().ok_or_else(|| {
@@ -108,7 +113,7 @@ fn main() -> Result<()> {
         (None, None) => session.target().rtt_scan_regions.clone(),
     };
 
-    let mut core = session.core(0).context("Error attaching to core # 0")?;
+    let mut core = session.core(0).context("Error attaching to core #0")?;
 
     eprintln!("Attaching to RTT...");
 

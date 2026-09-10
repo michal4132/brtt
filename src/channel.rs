@@ -187,7 +187,7 @@ pub(crate) struct Channel {
     last_read_ptr: Option<u64>,
 }
 
-// Chanels must follow this data layout when reading/writing memory in order to be compatible with
+// Channels must follow this data layout when reading/writing memory in order to be compatible with
 // the official RTT implementation.
 //
 // struct Channel {
@@ -268,7 +268,7 @@ impl Channel {
     ///
     /// See [`ChannelMode`] for more information on what the modes mean.
     pub fn set_mode(&self, core: &mut Core, mode: ChannelMode) -> Result<(), Error> {
-        tracing::debug!("Setting RTT channel {} mode to {:?}", self.number, mode);
+        log::debug!("Setting RTT channel {} mode to {:?}", self.number, mode);
         self.validate_core_id(core)?;
         let flags = self.info.read_flags(core, self.metadata_ptr)?;
 
@@ -400,8 +400,6 @@ impl UpChannel {
 
             buf = &mut buf[count..];
         }
-        self.0.last_read_ptr = Some(read);
-
         Ok((read, total))
     }
 
@@ -419,6 +417,9 @@ impl UpChannel {
                 .info
                 .write_read_buffer_ptr(core, self.0.metadata_ptr, read)?;
         }
+
+        // Keep host-side state in sync only after the target pointer write succeeds.
+        self.0.last_read_ptr = Some(read);
 
         Ok(total)
     }
@@ -566,7 +567,7 @@ fn read_c_string(core: &mut Core, ptr: NonZeroU64) -> Result<Option<String>, Err
         .map(|s| s.to_string_lossy().into_owned())
         .ok();
 
-    tracing::trace!("read_c_string() result = {:?}", return_value);
+    log::trace!("read_c_string() result = {:?}", return_value);
     Ok(return_value)
 }
 

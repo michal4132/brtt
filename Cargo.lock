@@ -195,7 +195,6 @@ name = "brtt"
 version = "0.1.5"
 dependencies = [
  "anyhow",
- "async-io",
  "chrono",
  "clap",
  "crossterm",
@@ -203,12 +202,12 @@ dependencies = [
  "defmt-parser",
  "docsplay",
  "env_logger",
+ "log",
  "parking_lot",
  "probe-rs",
  "probe-rs-target",
  "serde",
  "thiserror",
- "tracing",
  "zerocopy",
 ]
 

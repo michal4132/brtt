@@ -1,4 +1,4 @@
-use crate::cli::{ChannelMode, ChannelSpec};
+use crate::cli::{ChannelEncoding, ChannelSpec};
 use crate::defmt::{
     decode_frames, filter_level, level_enabled, level_name, DecodeOutput, DecodedFrame, DefmtData,
 };
@@ -33,7 +33,7 @@ enum ChannelPayload {
 
 struct UpChannelReader<'table> {
     spec: ChannelSpec,
-    buffer: [u8; 128],
+    buffer: [u8; 256],
     decoder: Option<Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>>,
     defmt_can_recover: bool,
 }
@@ -41,13 +41,15 @@ struct UpChannelReader<'table> {
 impl<'table> UpChannelReader<'table> {
     fn new(spec: ChannelSpec, defmt: Option<&'table DefmtData>) -> Result<Self> {
         let decoder = match (spec.mode, defmt) {
-            (ChannelMode::Defmt, Some(defmt)) => Some(defmt.table.new_stream_decoder()),
-            (ChannelMode::Defmt, None) => bail!("missing defmt table for channel {}", spec.index),
+            (ChannelEncoding::Defmt, Some(defmt)) => Some(defmt.table.new_stream_decoder()),
+            (ChannelEncoding::Defmt, None) => {
+                bail!("missing defmt table for channel {}", spec.index)
+            }
             _ => None,
         };
         Ok(Self {
             spec,
-            buffer: [0; 128],
+            buffer: [0; 256],
             decoder,
             defmt_can_recover: defmt.is_some_and(|defmt| defmt.table.encoding().can_recover()),
         })
@@ -124,7 +126,7 @@ enum InputAction {
 
 impl EscapeState {
     fn handle_key(self, key: KeyEvent) -> (Self, InputAction) {
-        if key.kind != KeyEventKind::Press {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return (self, InputAction::Ignore);
         }
 
@@ -189,6 +191,15 @@ fn key_to_action(key: KeyEvent) -> InputAction {
     let mut bytes = Vec::new();
 
     match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if c.is_ascii_alphabetic() {
+                bytes.push((c.to_ascii_lowercase() as u8) & 0x1f);
+            }
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
+            bytes.push(0x1b);
+            bytes.extend_from_slice(c.to_string().as_bytes());
+        }
         KeyCode::Char(c) => bytes.extend_from_slice(c.to_string().as_bytes()),
         KeyCode::Enter => bytes.push(b'\n'),
         KeyCode::Tab => bytes.push(b'\t'),
@@ -253,12 +264,12 @@ fn poll_up_channels(
                 logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
             }
             match reader.spec.mode {
-                ChannelMode::Ascii => events.push(ChannelEvent {
+                ChannelEncoding::Ascii => events.push(ChannelEvent {
                     channel_idx: reader.spec.index,
                     payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
                     timestamp,
                 }),
-                ChannelMode::Defmt => {
+                ChannelEncoding::Defmt => {
                     let frames = decode_frames(
                         &mut **reader.decoder.as_mut().expect("defmt decoder initialized"),
                         &reader.buffer[..count],
@@ -376,12 +387,10 @@ fn render_channel_bytes_colored_inner(
             }
         }
 
-        if line_start {
-            state.line_start = false;
-        }
-
         if byte == b'\n' {
-            output.write_all(b"\r")?;
+            if state.interactive {
+                output.write_all(b"\r")?;
+            }
             state.line_start = true;
         } else {
             state.line_start = false;
@@ -433,7 +442,11 @@ fn render_ascii_chunk(
     for line in complete {
         let foreground = erase_foreground(state, output)?;
         render_channel_bytes(&line, Some(channel), timestamp, state, output)?;
-        output.write_all(b"\r\n")?;
+        if state.interactive {
+            output.write_all(b"\r\n")?;
+        } else {
+            output.write_all(b"\n")?;
+        }
         state.line_start = true;
         if let Some(saved) = foreground {
             if saved.channel != channel {
@@ -469,7 +482,11 @@ fn render_complete_line(
     let foreground = erase_foreground(state, output)?;
     render_channel_bytes_colored(bytes, Some(channel), timestamp, state, output, color)?;
     if !state.line_start {
-        output.write_all(b"\r\n")?;
+        if state.interactive {
+            output.write_all(b"\r\n")?;
+        } else {
+            output.write_all(b"\n")?;
+        }
         state.line_start = true;
     }
     if let Some(saved) = foreground {
@@ -757,7 +774,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     )?;
 
     if config.reset {
-        core.reset()?;
+        core.reset().context("Error resetting target")?;
     }
 
     let mut down_buf = Vec::new();
@@ -769,7 +786,10 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     state.color = match config.color {
         crate::cli::ColorMode::Always => true,
         crate::cli::ColorMode::Never => false,
-        crate::cli::ColorMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        crate::cli::ColorMode::Auto => {
+            std::io::IsTerminal::is_terminal(&std::io::stdout())
+                && std::env::var_os("NO_COLOR").is_none()
+        }
     };
     let stdin_setup = config.down_configured
         && interactive_input_available(rtt.down_channel(config.down_channel).is_some());
@@ -811,42 +831,52 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
             }
         }
 
-        if stdin_setup && event::poll(config.poll_interval)? {
-            if let Event::Key(key_event) = event::read()? {
-                let (next_state, action) = escape_state.handle_key(key_event);
-                escape_state = next_state;
+        if stdin_setup {
+            let input_ready = match event::poll(config.poll_interval) {
+                Ok(ready) => ready,
+                Err(err) => break 'read_loop Err(err.into()),
+            };
+            if input_ready {
+                let event = match event::read() {
+                    Ok(event) => event,
+                    Err(err) => break 'read_loop Err(err.into()),
+                };
+                if let Event::Key(key_event) = event {
+                    let (next_state, action) = escape_state.handle_key(key_event);
+                    escape_state = next_state;
 
-                match action {
-                    InputAction::Send(bytes) => {
-                        if state.local_echo {
-                            if let Err(err) =
-                                render_bytes(&bytes, Instant::now(), &mut state, &mut output)
-                            {
-                                break 'read_loop Err(anyhow::anyhow!(
-                                    "Error writing local echo: {err}"
-                                ));
+                    match action {
+                        InputAction::Send(bytes) => {
+                            if state.local_echo {
+                                if let Err(err) =
+                                    render_bytes(&bytes, Instant::now(), &mut state, &mut output)
+                                {
+                                    break 'read_loop Err(anyhow::anyhow!(
+                                        "Error writing local echo: {err}"
+                                    ));
+                                }
+                            }
+                            down_buf.extend_from_slice(&bytes);
+                        }
+                        InputAction::Command(command) => {
+                            match dispatch_command(
+                                command,
+                                core,
+                                &mut rtt,
+                                &config,
+                                &mut state,
+                                &mut output,
+                            ) {
+                                Ok(true) => break 'read_loop Ok(()),
+                                Ok(false) => {}
+                                Err(err) => break 'read_loop Err(err),
                             }
                         }
-                        down_buf.extend_from_slice(&bytes);
+                        InputAction::Ignore => {}
                     }
-                    InputAction::Command(command) => {
-                        match dispatch_command(
-                            command,
-                            core,
-                            &mut rtt,
-                            &config,
-                            &mut state,
-                            &mut output,
-                        ) {
-                            Ok(true) => break 'read_loop Ok(()),
-                            Ok(false) => {}
-                            Err(err) => break 'read_loop Err(err),
-                        }
-                    }
-                    InputAction::Ignore => {}
                 }
             }
-        } else if !stdin_setup {
+        } else {
             std::thread::sleep(config.poll_interval);
         }
 
@@ -965,6 +995,33 @@ mod tests {
     }
 
     #[test]
+    fn control_and_alt_keys_keep_terminal_encoding() {
+        assert_eq!(
+            EscapeState::Normal.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            (EscapeState::Normal, InputAction::Send(vec![1]))
+        );
+        assert_eq!(
+            EscapeState::Normal.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            (EscapeState::Normal, InputAction::Send(vec![21]))
+        );
+        assert_eq!(
+            EscapeState::Normal.handle_key(key(KeyCode::Char('b'), KeyModifiers::ALT)),
+            (EscapeState::Normal, InputAction::Send(b"\x1bb".to_vec()))
+        );
+    }
+
+    #[test]
+    fn repeated_keys_are_forwarded() {
+        let mut repeated = key(KeyCode::Char('x'), KeyModifiers::NONE);
+        repeated.kind = KeyEventKind::Repeat;
+
+        assert_eq!(
+            EscapeState::Normal.handle_key(repeated),
+            (EscapeState::Normal, InputAction::Send(b"x".to_vec()))
+        );
+    }
+
+    #[test]
     fn unknown_command_keys_pass_through_and_reset_state() {
         assert_eq!(
             EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
@@ -1028,6 +1085,17 @@ mod tests {
     }
 
     #[test]
+    fn redirected_output_uses_line_feeds() {
+        let mut state = SessionState::new();
+        state.interactive = false;
+        let mut output = Vec::new();
+
+        render_bytes(b"text\n", Instant::now(), &mut state, &mut output).unwrap();
+
+        assert_eq!(output, b"text\n");
+    }
+
+    #[test]
     fn toggle_status_returns_cursor_to_column_zero() {
         let mut output = Vec::new();
 
@@ -1073,7 +1141,7 @@ mod tests {
             chip: "nRF52840_xxAA".to_string(),
             up_specs: vec![ChannelSpec {
                 index: 2,
-                mode: ChannelMode::Ascii,
+                mode: ChannelEncoding::Ascii,
             }],
             down_channel: 1,
             down_configured: true,
