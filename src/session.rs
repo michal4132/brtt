@@ -594,26 +594,26 @@ fn write_config(
     state: &SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    writeln!(output, "\r\nConfiguration:")?;
-    writeln!(output, "  Probe: {}", config.probe)?;
-    writeln!(output, "  Chip: {}", config.chip)?;
+    write!(output, "\r\nConfiguration:\r\n")?;
+    write!(output, "  Probe: {}\r\n", config.probe)?;
+    write!(output, "  Chip: {}\r\n", config.chip)?;
     write!(output, "  Up channels:")?;
     for spec in &config.up_specs {
         write!(output, " {}:{}", spec.index, spec.mode.name())?;
     }
-    writeln!(output)?;
+    write!(output, "\r\n")?;
     if config.down_configured {
-        writeln!(output, "  Down channel: {}", config.down_channel)?;
+        write!(output, "  Down channel: {}\r\n", config.down_channel)?;
     } else {
-        writeln!(output, "  Down channel: disabled")?;
+        write!(output, "  Down channel: disabled\r\n")?;
     }
-    writeln!(
+    write!(
         output,
-        "  Poll interval: {} ms",
+        "  Poll interval: {} ms\r\n",
         config.poll_interval.as_millis()
     )?;
-    writeln!(output, "  Timestamps: {}", on_or_off(state.timestamps))?;
-    writeln!(output, "  Local echo: {}", on_or_off(state.local_echo))?;
+    write!(output, "  Timestamps: {}\r\n", on_or_off(state.timestamps))?;
+    write!(output, "  Local echo: {}\r\n", on_or_off(state.local_echo))?;
     output.flush()
 }
 
@@ -632,6 +632,10 @@ fn on_or_off(enabled: bool) -> &'static str {
     } else {
         "off"
     }
+}
+
+fn write_toggle_status(output: &mut impl Write, label: &str, enabled: bool) -> std::io::Result<()> {
+    write!(output, "\r\n{label}: {}\r\n", on_or_off(enabled))
 }
 
 fn interactive_input_available(has_down_channel: bool) -> bool {
@@ -666,13 +670,13 @@ fn dispatch_command(
         }
         SessionCommand::ToggleTimestamps => {
             state.timestamps = !state.timestamps;
-            writeln!(output, "\r\nTimestamps: {}", on_or_off(state.timestamps))?;
+            write_toggle_status(output, "Timestamps", state.timestamps)?;
             output.flush()?;
             state.line_start = true;
         }
         SessionCommand::ToggleLocalEcho => {
             state.local_echo = !state.local_echo;
-            writeln!(output, "\r\nLocal echo: {}", on_or_off(state.local_echo))?;
+            write_toggle_status(output, "Local echo", state.local_echo)?;
             output.flush()?;
             state.line_start = true;
         }
@@ -680,7 +684,7 @@ fn dispatch_command(
             core.reset().context("Error resetting target")?;
             // The target reset may rewind RTT pointers while the host retains old read state.
             rtt.reset_read_state();
-            writeln!(output, "\r\nTarget reset.")?;
+            write!(output, "\r\nTarget reset.\r\n")?;
             output.flush()?;
             state.line_start = true;
         }
@@ -1021,6 +1025,15 @@ mod tests {
         render_bytes(b"text\n", Instant::now(), &mut state, &mut output).unwrap();
 
         assert_eq!(output, b"text\r\n");
+    }
+
+    #[test]
+    fn toggle_status_returns_cursor_to_column_zero() {
+        let mut output = Vec::new();
+
+        write_toggle_status(&mut output, "Timestamps", true).unwrap();
+
+        assert_eq!(output, b"\r\nTimestamps: on\r\n");
     }
 
     #[test]
