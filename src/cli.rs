@@ -121,10 +121,9 @@ pub(crate) struct Opts {
     #[clap(
         short,
         long,
-        default_value = "0",
-        help = "Specify probe number or 'list' to list probes."
+        help = "Specify probe number or 'list' to list probes. Prompts when multiple probes are available."
     )]
-    pub(crate) probe: ProbeInfo,
+    pub(crate) probe: Option<ProbeInfo>,
 
     #[clap(
         short,
@@ -308,7 +307,7 @@ impl Opts {
 
     fn validate_operation_modes(&self) -> Result<()> {
         if self.debug_defmt_table {
-            if self.list || matches!(self.probe, ProbeInfo::List) {
+            if self.list || matches!(self.probe, Some(ProbeInfo::List)) {
                 bail!("--debug-defmt-table cannot be combined with --list or --probe list");
             }
             if self.has_session_options() || self.color != ColorMode::Auto {
@@ -316,14 +315,14 @@ impl Opts {
             }
         }
         if self.list {
-            if matches!(self.probe, ProbeInfo::List) {
+            if matches!(self.probe, Some(ProbeInfo::List)) {
                 bail!("--list cannot be combined with --probe list");
             }
             if self.has_session_options() || self.color != ColorMode::Auto {
                 bail!("--list cannot be combined with session options");
             }
         }
-        if matches!(self.probe, ProbeInfo::List)
+        if matches!(self.probe, Some(ProbeInfo::List))
             && (self.list
                 || self.has_session_options()
                 || self.elf.is_some()
@@ -445,6 +444,7 @@ mod tests {
         assert!(opts.down.is_none());
         assert!(opts.scan_region.is_none());
         assert!(!opts.timestamps);
+        assert!(opts.probe.is_none());
     }
 
     #[test]
@@ -462,6 +462,13 @@ mod tests {
         let opts = Opts::try_parse_from(["brtt", "--timestamp"]).unwrap();
 
         assert!(opts.timestamps);
+    }
+
+    #[test]
+    fn opts_preserve_explicit_probe_zero() {
+        let opts = Opts::try_parse_from(["brtt", "--probe", "0"]).unwrap();
+
+        assert_eq!(opts.probe, Some(ProbeInfo::Number(0)));
     }
 
     fn validate_args(args: &[&str]) -> std::result::Result<(), String> {
