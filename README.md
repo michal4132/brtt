@@ -69,3 +69,11 @@ During a session, press `Ctrl-T` followed by a command key:
 - `e`: Toggle local echo.
 - `R`: Reset the target.
 - `Ctrl-T`: Send a literal `Ctrl-T` to the down channel.
+
+The session prints `Press ctrl-t ? for help` after connecting. `Ctrl-C` is sent
+to the target as byte `0x03`; use `Ctrl-T q` to quit `brtt`.
+
+Unlike `tio`, `brtt` does not implement serial-port settings or serial-device
+discovery/reconnect, input/output hex modes, output delays, character mapping,
+scripts, socket/exec redirection, RS-485, connect alerts, or tio-specific log
+file options. These features do not apply to an RTT debug session.

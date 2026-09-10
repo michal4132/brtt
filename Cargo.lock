@@ -200,15 +200,9 @@ dependencies = [
  "crossterm",
  "defmt-decoder",
  "defmt-parser",
- "docsplay",
  "env_logger",
  "log",
- "parking_lot",
  "probe-rs",
- "probe-rs-target",
- "serde",
- "thiserror",
- "zerocopy",
 ]
 
 [[package]]

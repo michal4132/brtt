@@ -4,7 +4,8 @@ use crate::defmt::{
 };
 use crate::logger::Logger;
 use anyhow::{bail, Context, Result};
-use brtt::rtt::Rtt;
+use brtt::rtt::{try_attach_to_rtt, Rtt, ScanRegion};
+use brtt::RttChannel;
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{
@@ -16,6 +17,9 @@ use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{stdout, IsTerminal};
 use std::time::{Duration, Instant};
+
+const RTT_REATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+const TARGET_HALT_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct ChannelEvent {
@@ -53,6 +57,11 @@ impl<'table> UpChannelReader<'table> {
             decoder,
             defmt_can_recover: defmt.is_some_and(|defmt| defmt.table.encoding().can_recover()),
         })
+    }
+
+    fn reset(&mut self, defmt: Option<&'table DefmtData>) -> Result<()> {
+        *self = Self::new(self.spec, defmt)?;
+        Ok(())
     }
 }
 
@@ -128,13 +137,6 @@ impl EscapeState {
     fn handle_key(self, key: KeyEvent) -> (Self, InputAction) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return (self, InputAction::Ignore);
-        }
-
-        if is_control_key(key, 'c') {
-            return (
-                EscapeState::Normal,
-                InputAction::Command(SessionCommand::Quit),
-            );
         }
 
         match self {
@@ -218,6 +220,12 @@ fn key_to_action(key: KeyEvent) -> InputAction {
     }
 }
 
+fn channel_by_number<T: RttChannel>(channels: &mut [T], number: usize) -> Option<&mut T> {
+    channels
+        .iter_mut()
+        .find(|channel| channel.number() == number)
+}
+
 fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
     for spec in specs {
         let channel = usize::try_from(spec.index).with_context(|| {
@@ -227,11 +235,35 @@ fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
             )
         })?;
 
-        if rtt.up_channel(channel).is_none() {
+        if channel_by_number(rtt.up_channels(), channel).is_none() {
             bail!("Error: up channel {} does not exist.", spec.index);
         }
     }
 
+    Ok(())
+}
+
+fn validate_channels(rtt: &mut Rtt, config: &SessionConfig) -> Result<()> {
+    validate_up_specs(rtt, &config.up_specs)?;
+    if config.down_configured
+        && channel_by_number(rtt.down_channels(), config.down_channel).is_none()
+    {
+        bail!(
+            "Error: down channel {} does not exist.",
+            config.down_channel
+        );
+    }
+    Ok(())
+}
+
+fn reset_and_reattach(core: &mut Core, rtt: &mut Rtt, scan_region: &ScanRegion) -> Result<()> {
+    core.halt(TARGET_HALT_TIMEOUT)
+        .context("Error halting target before reset")?;
+    Rtt::clear_control_block(core, &ScanRegion::Exact(rtt.ptr()))
+        .context("Error clearing stale RTT control block before reset")?;
+    core.reset().context("Error resetting target")?;
+    *rtt = try_attach_to_rtt(core, RTT_REATTACH_TIMEOUT, scan_region)
+        .context("Error reattaching to RTT after target reset")?;
     Ok(())
 }
 
@@ -253,7 +285,7 @@ fn poll_up_channels(
             )
         })?;
 
-        let count = match rtt.up_channel(channel) {
+        let count = match channel_by_number(rtt.up_channels(), channel) {
             Some(channel) => channel.read(core, &mut reader.buffer)?,
             None => continue,
         };
@@ -601,7 +633,16 @@ fn io_error(error: anyhow::Error) -> std::io::Error {
 fn write_help(output: &mut impl Write) -> std::io::Result<()> {
     write!(
         output,
-        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  e  Toggle local echo\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n"
+        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  e  Toggle local echo\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\nNot implemented from tio (not applicable to RTT):\r\n  serial port settings, device auto-connect/reconnect, input/output hex modes,\r\n  output delays, character mapping, scripts, socket/exec redirection, RS-485,\r\n  connect alerts, and tio-specific log file options.\r\n"
+    )?;
+    output.flush()
+}
+
+fn write_session_banner(output: &mut impl Write) -> std::io::Result<()> {
+    write!(
+        output,
+        "brtt {}\r\nPress ctrl-t ? for help\r\nConnected to target\r\n",
+        env!("CARGO_PKG_VERSION")
     )?;
     output.flush()
 }
@@ -659,11 +700,12 @@ fn interactive_input_available(has_down_channel: bool) -> bool {
     has_down_channel && std::io::stdin().is_terminal()
 }
 
-fn dispatch_command(
+fn dispatch_command<'table>(
     command: SessionCommand,
     core: &mut Core,
     rtt: &mut Rtt,
-    config: &SessionConfig,
+    config: &'table SessionConfig,
+    up_readers: &mut [UpChannelReader<'table>],
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> Result<bool> {
@@ -698,9 +740,11 @@ fn dispatch_command(
             state.line_start = true;
         }
         SessionCommand::ResetTarget => {
-            core.reset().context("Error resetting target")?;
-            // The target reset may rewind RTT pointers while the host retains old read state.
-            rtt.reset_read_state();
+            reset_and_reattach(core, rtt, &config.scan_region)?;
+            validate_channels(rtt, config)?;
+            for reader in up_readers {
+                reader.reset(config.defmt.as_ref())?;
+            }
             write!(output, "\r\nTarget reset.\r\n")?;
             output.flush()?;
             state.line_start = true;
@@ -739,6 +783,7 @@ pub(crate) struct SessionConfig {
     pub(crate) log: Option<std::path::PathBuf>,
     pub(crate) log_per_channel: bool,
     pub(crate) log_format: crate::cli::LogFormat,
+    pub(crate) scan_region: ScanRegion,
 }
 
 struct RawModeGuard;
@@ -750,7 +795,11 @@ impl Drop for RawModeGuard {
 }
 
 pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> {
-    validate_up_specs(&mut rtt, &config.up_specs)?;
+    if config.reset {
+        reset_and_reattach(core, &mut rtt, &config.scan_region)?;
+    }
+
+    validate_channels(&mut rtt, &config)?;
     let defmt_ref = config.defmt.as_ref();
     let mut up_readers = config
         .up_specs
@@ -759,23 +808,12 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         .map(|spec| UpChannelReader::new(spec, defmt_ref))
         .collect::<Result<Vec<_>>>()?;
 
-    if config.down_configured && rtt.down_channel(config.down_channel).is_none() {
-        bail!(
-            "Error: down channel {} does not exist.",
-            config.down_channel
-        );
-    }
-
     let mut logger = Logger::new(
         config.log.as_deref(),
         config.log_per_channel,
         config.log_format,
         config.up_specs.len(),
     )?;
-
-    if config.reset {
-        core.reset().context("Error resetting target")?;
-    }
 
     let mut down_buf = Vec::new();
     let mut escape_state = EscapeState::Normal;
@@ -792,7 +830,13 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         }
     };
     let stdin_setup = config.down_configured
-        && interactive_input_available(rtt.down_channel(config.down_channel).is_some());
+        && interactive_input_available(
+            channel_by_number(rtt.down_channels(), config.down_channel).is_some(),
+        );
+    if stdin_setup {
+        // Ask the target shell to redraw its normal prompt at session start.
+        down_buf.push(b'\n');
+    }
 
     let _raw_mode = if stdin_setup {
         terminal::enable_raw_mode()?;
@@ -802,6 +846,9 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     };
 
     let mut output = stdout();
+    if state.interactive {
+        write_session_banner(&mut output)?;
+    }
     let result = 'read_loop: loop {
         let events = match poll_up_channels(
             &mut rtt,
@@ -864,6 +911,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
                                 core,
                                 &mut rtt,
                                 &config,
+                                &mut up_readers,
                                 &mut state,
                                 &mut output,
                             ) {
@@ -881,7 +929,8 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         }
 
         if config.down_configured {
-            if let Some(down_channel) = rtt.down_channel(config.down_channel) {
+            if let Some(down_channel) = channel_by_number(rtt.down_channels(), config.down_channel)
+            {
                 if !down_buf.is_empty() {
                     let count = match down_channel.write(core, down_buf.as_mut()) {
                         Ok(count) => count,
@@ -909,6 +958,22 @@ mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
 
+    struct TestChannel(usize);
+
+    impl RttChannel for TestChannel {
+        fn number(&self) -> usize {
+            self.0
+        }
+
+        fn name(&self) -> Option<&str> {
+            None
+        }
+
+        fn buffer_size(&self) -> usize {
+            0
+        }
+    }
+
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent {
             code,
@@ -916,6 +981,16 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn channel_lookup_uses_rtt_number_not_slice_index() {
+        let mut channels = [TestChannel(1), TestChannel(3)];
+
+        assert_eq!(channel_by_number(&mut channels, 1).unwrap().number(), 1);
+        assert_eq!(channel_by_number(&mut channels, 3).unwrap().number(), 3);
+        assert!(channel_by_number(&mut channels, 0).is_none());
+        assert!(channel_by_number(&mut channels, 2).is_none());
     }
 
     #[test]
@@ -976,6 +1051,14 @@ mod tests {
 
         assert_eq!(state, EscapeState::Normal);
         assert_eq!(action, InputAction::Send(vec![0x14]));
+    }
+
+    #[test]
+    fn ctrl_c_is_forwarded_to_the_target() {
+        assert_eq!(
+            EscapeState::Normal.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            (EscapeState::Normal, InputAction::Send(vec![0x03]))
+        );
     }
 
     #[test]
@@ -1054,6 +1137,19 @@ mod tests {
         assert!(output.contains("t  Toggle timestamps"));
         assert!(output.contains("e  Toggle local echo"));
         assert!(output.contains("R  Reset target"));
+        assert!(output.contains("Ctrl-C is sent to the target"));
+        assert!(output.contains("Not implemented from tio"));
+    }
+
+    #[test]
+    fn session_banner_shows_escape_help() {
+        let mut output = Vec::new();
+
+        write_session_banner(&mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Press ctrl-t ? for help"));
+        assert!(output.contains("Connected to target"));
     }
 
     #[test]
@@ -1154,6 +1250,7 @@ mod tests {
             log: None,
             log_per_channel: false,
             log_format: crate::cli::LogFormat::Decoded,
+            scan_region: ScanRegion::Exact(0x2000_0000),
         };
         let state = SessionState::new();
         let mut output = Vec::new();

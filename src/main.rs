@@ -3,8 +3,8 @@ mod defmt;
 mod logger;
 mod session;
 
-use brtt::channel::RttChannel;
 use brtt::rtt::Rtt;
+use brtt::RttChannel;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -115,6 +115,8 @@ fn main() -> Result<()> {
 
     let mut core = session.core(0).context("Error attaching to core #0")?;
 
+    ensure_supported_target(core.is_64_bit())?;
+
     eprintln!("Attaching to RTT...");
 
     let mut rtt = Rtt::attach_region(&mut core, &scan_region).context("Error attaching to RTT")?;
@@ -154,8 +156,18 @@ fn main() -> Result<()> {
             log: opts.log,
             log_per_channel: opts.log_per_channel,
             log_format: opts.log_format.unwrap_or(cli::LogFormat::Decoded),
+            scan_region,
         },
     )
+}
+
+fn ensure_supported_target(is_64_bit: bool) -> Result<()> {
+    if is_64_bit {
+        bail!(
+            "64-bit targets are not supported until probe-rs fixes 32-bit RTT offset writes on 64-bit targets"
+        );
+    }
+    Ok(())
 }
 
 fn select_probe(probes: &[DebugProbeInfo], requested: Option<&ProbeInfo>) -> Result<usize> {
@@ -267,5 +279,11 @@ mod tests {
             automatic_probe_selection(2, Some(&ProbeInfo::Number(0))).unwrap(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn rejects_64_bit_targets_until_probe_rs_rtt_writes_are_fixed() {
+        assert!(ensure_supported_target(false).is_ok());
+        assert!(ensure_supported_target(true).is_err());
     }
 }
