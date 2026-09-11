@@ -15,7 +15,7 @@ brtt [OPTIONS]
 - `-p, --probe <PROBE>`: Specify the probe number. Use `list` to see all available probes. A single available probe is selected automatically; multiple probes prompt for a selection.
 - `-c, --chip <CHIP>`: Specify the target chip type (e.g., `nRF52840_xxAA`). If not provided, `brtt` will attempt to auto-detect it.
 - `-l, --list`: Attach to the target, list available RTT up and down channels, and exit. `--chip`, `--scan-region`, and `--elf` may be used to help discover RTT.
-- `-u, --up <CHANNEL[:MODE]>`: The RTT "up" channel (target to host) to use. `MODE` can be `ascii` or `defmt` and defaults to `ascii`. Defaults to channel 0 and may be repeated.
+- `-u, --up <CHANNEL[:MODE]>`: The RTT "up" channel (target to host) to use. `MODE` can be `terminal` or `defmt` and defaults to `terminal`. Defaults to channel 0 and may be repeated.
 - `-d, --down <CHANNEL>`: The RTT "down" channel (host to target) for keyboard input. Only one channel is supported and it defaults to channel 0.
 - `--no-down`: Disable the default down channel and keyboard input for output-only sessions.
 - `-r, --reset`: Reset the target after opening the RTT session.
@@ -28,16 +28,16 @@ brtt [OPTIONS]
 - `--color <auto|always|never>`: Select terminal coloring for channel labels and defmt levels.
 - `-L, --log <PATH>`: Write session output to a log file.
 - `--log-per-channel`: Write separate `.chN` files instead of one merged log.
-- `--log-format <decoded|raw>`: Log decoded text or exact RTT bytes. Raw merged logs require a single up channel.
+- `--log-format <decoded|raw>`: Log cleaned terminal text or exact RTT bytes. Decoded logs retain echoed commands while removing terminal redraw controls; raw merged logs require a single up channel.
 
 ### Example: nRF54L15 with two up channels
 
-This monitors the ASCII terminal on channel 0 and defmt output on channel 1:
+This monitors the terminal on channel 0 and defmt output on channel 1:
 
 ```sh
 brtt --release -- \
   --chip nRF54L15 \
-  --up 0:ascii \
+  --up 0:terminal \
   --up 1:defmt \
   --elf "path/to/elf"
 ```
@@ -52,7 +52,7 @@ Internal diagnostics are written to stderr and warnings are shown by default. Se
 
 Defmt filters apply only to frames already sent by the target. A module-specific filter changes that module while leaving other modules unchanged: `app=debug` shows debug-or-higher messages from `app` and leaves other modules at their normal level. Use `warn,app=debug` for a warning threshold globally with a more verbose `app` override.
 
-Decoded logs buffer incomplete lines until a newline is received. Buffered text is flushed when the session exits normally or reports an error. Raw logs preserve the exact RTT bytes, including malformed defmt data.
+Decoded terminal logs use a stateful ANSI/UTF-8 terminal model: they interpret carriage returns, backspaces, tabs, cursor movement, and erase-line sequences while retaining echoed commands. Defmt logs remain formatted text and are not terminal-emulated. Incomplete lines are buffered until a newline is received and flushed when the session exits normally or reports an error. Raw logs preserve the exact RTT bytes, including malformed defmt data.
 
 ## Nix
 

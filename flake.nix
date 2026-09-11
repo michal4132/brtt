@@ -31,7 +31,7 @@
           pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
-            packages = [ pkgs.rustc pkgs.cargo ];
+            packages = [ pkgs.rustc pkgs.cargo pkgs.rustfmt ];
           };
         });
     };
