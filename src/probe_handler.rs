@@ -63,13 +63,6 @@ pub(crate) fn attach(
     })
 }
 
-pub(crate) fn ensure_supported_target(is_64_bit: bool) -> Result<()> {
-    if is_64_bit {
-        bail!("64-bit targets are not supported until probe-rs fixes 32-bit RTT offset writes on 64-bit targets");
-    }
-    Ok(())
-}
-
 fn select(probes: &[DebugProbeInfo], requested: Option<&ProbeInfo>) -> Result<usize> {
     if let Some(index) = automatic_selection(probes.len(), requested)? {
         return Ok(index);
@@ -136,20 +129,5 @@ fn write_probe_list(mut stream: impl Write, probes: &[DebugProbeInfo]) -> io::Re
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn selection_defaults_only_when_single_probe_exists() {
-        assert_eq!(automatic_selection(1, None).unwrap(), Some(0));
-        assert_eq!(automatic_selection(2, None).unwrap(), None);
-    }
-
-    #[test]
-    fn explicit_probe_zero_is_not_treated_as_missing() {
-        assert_eq!(
-            automatic_selection(2, Some(&ProbeInfo::Number(0))).unwrap(),
-            Some(0)
-        );
-    }
-}
+#[path = "../tests/probe_handler.rs"]
+mod tests;

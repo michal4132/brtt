@@ -4,6 +4,7 @@ use crate::defmt::{
     Filter, MAX_DECODE_BUFFERED_BYTES,
 };
 use crate::logger::{DecodedStream, Logger};
+use crate::probe_handler::AttachedProbe;
 use anyhow::{bail, Context, Result};
 use brtt::rtt::{
     try_attach_to_rtt, try_attach_to_rtt_incremental, Error as RttError, Rtt, ScanRegion,
@@ -21,6 +22,7 @@ use std::io::prelude::*;
 use std::io::{stdout, BufWriter, IsTerminal};
 use std::time::{Duration, Instant};
 
+const RTT_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const RTT_REATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_HALT_TIMEOUT: Duration = Duration::from_millis(100);
 const UP_CHANNEL_BUFFER_SIZE: usize = 4 * 1024;
@@ -395,6 +397,11 @@ fn is_control_key(key: KeyEvent, character: char) -> bool {
     key.code == KeyCode::Char(character) && key.modifiers == KeyModifiers::CONTROL
 }
 
+fn push_char(bytes: &mut Vec<u8>, character: char) {
+    let mut buffer = [0u8; 4];
+    bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+}
+
 fn key_to_action(key: KeyEvent) -> InputAction {
     let mut bytes = Vec::new();
 
@@ -406,12 +413,13 @@ fn key_to_action(key: KeyEvent) -> InputAction {
         }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) => {
             bytes.push(0x1b);
-            bytes.extend_from_slice(c.to_string().as_bytes());
+            push_char(&mut bytes, c);
         }
-        KeyCode::Char(c) => bytes.extend_from_slice(c.to_string().as_bytes()),
+        KeyCode::Char(c) => push_char(&mut bytes, c),
         KeyCode::Enter => bytes.push(b'\n'),
         KeyCode::Tab => bytes.push(b'\t'),
         KeyCode::Backspace => bytes.push(8u8),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
         KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
         KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
         KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
@@ -459,6 +467,105 @@ fn validate_channels(rtt: &mut Rtt, config: &SessionConfig) -> Result<()> {
     Ok(())
 }
 
+/// Runs a target-dependent operation: attach to the probe session's core, find
+/// the RTT control block, then either list channels or run the read loop.
+pub(crate) fn start(
+    attached: AttachedProbe,
+    opts: Opts,
+    defmt: Option<DefmtData>,
+    elf_region: Option<ScanRegion>,
+) -> Result<()> {
+    let AttachedProbe {
+        mut session,
+        label,
+        chip,
+    } = attached;
+
+    let (scan_region, automatic_scan) = resolve_scan_region(
+        elf_region.as_ref(),
+        opts.scan_region.as_ref(),
+        &session.target().rtt_scan_regions,
+    );
+
+    let mut core = session.core(0).context("Error attaching to core #0")?;
+    let mut rtt = attach_initial_rtt(&mut core, &scan_region, automatic_scan)?;
+
+    if opts.list {
+        println!("Up channels:");
+        list_channels(rtt.up_channels());
+
+        println!("Down channels:");
+        list_channels(rtt.down_channels());
+
+        return Ok(());
+    }
+
+    let config = SessionConfig::from_opts(opts, label, chip, defmt, scan_region, automatic_scan)?;
+    run_loop(&mut core, rtt, config)
+}
+
+/// Precedence: ELF-provided `_SEGGER_RTT` > explicit `--scan-region` > target default.
+/// Automatic scanning is only used when neither the ELF nor the user pins a region.
+fn resolve_scan_region(
+    elf_region: Option<&ScanRegion>,
+    requested: Option<&ScanRegion>,
+    target_default: &ScanRegion,
+) -> (ScanRegion, bool) {
+    match (elf_region, requested) {
+        (Some(region), Some(_)) => {
+            eprintln!("Ignoring --scan-region because --elf provides _SEGGER_RTT.");
+            (region.clone(), false)
+        }
+        (Some(region), None) | (None, Some(region)) => (region.clone(), false),
+        (None, None) => (target_default.clone(), true),
+    }
+}
+
+fn try_attach_rtt(
+    core: &mut Core,
+    timeout: Duration,
+    region: &ScanRegion,
+    automatic: bool,
+) -> Result<Rtt, RttError> {
+    if automatic {
+        try_attach_to_rtt_incremental(core, timeout, region)
+    } else {
+        try_attach_to_rtt(core, timeout, region)
+    }
+}
+
+fn ensure_rtt_compatible_target(is_64_bit: bool) -> Result<()> {
+    if is_64_bit {
+        bail!("64-bit targets are not supported until probe-rs fixes 32-bit RTT offset writes on 64-bit targets");
+    }
+    Ok(())
+}
+
+fn attach_initial_rtt(core: &mut Core, region: &ScanRegion, automatic: bool) -> Result<Rtt> {
+    ensure_rtt_compatible_target(core.is_64_bit())?;
+    eprintln!("Attaching to RTT...");
+    let rtt = try_attach_rtt(core, RTT_ATTACH_TIMEOUT, region, automatic)
+        .context("Error attaching to RTT")?;
+    eprintln!("Found control block at {:#010x}", rtt.ptr());
+    Ok(rtt)
+}
+
+fn list_channels(channels: &[impl RttChannel]) {
+    if channels.is_empty() {
+        println!("  (none)");
+        return;
+    }
+
+    for chan in channels.iter() {
+        println!(
+            "  {}: {} (buffer size {})",
+            chan.number(),
+            chan.name().unwrap_or("(no name)"),
+            chan.buffer_size(),
+        );
+    }
+}
+
 fn reset_and_reattach(
     core: &mut Core,
     rtt: &mut Rtt,
@@ -470,12 +577,8 @@ fn reset_and_reattach(
     Rtt::clear_control_block(core, &ScanRegion::Exact(rtt.ptr()))
         .context("Error clearing stale RTT control block before reset")?;
     core.reset().context("Error resetting target")?;
-    *rtt = if automatic_scan {
-        try_attach_to_rtt_incremental(core, RTT_REATTACH_TIMEOUT, scan_region)
-    } else {
-        try_attach_to_rtt(core, RTT_REATTACH_TIMEOUT, scan_region)
-    }
-    .context("Error reattaching to RTT after target reset")?;
+    *rtt = try_attach_rtt(core, RTT_REATTACH_TIMEOUT, scan_region, automatic_scan)
+        .context("Error reattaching to RTT after target reset")?;
     Ok(())
 }
 
@@ -488,11 +591,12 @@ fn reattach_after_target_restart<'table, W: Write>(
     down_buf: &mut DownBuffer,
     render: &mut OutputContext<'_, W>,
 ) -> Result<()> {
-    *rtt = if config.automatic_scan {
-        try_attach_to_rtt_incremental(core, RTT_REATTACH_TIMEOUT, &config.scan_region)
-    } else {
-        try_attach_to_rtt(core, RTT_REATTACH_TIMEOUT, &config.scan_region)
-    }
+    *rtt = try_attach_rtt(
+        core,
+        RTT_REATTACH_TIMEOUT,
+        &config.scan_region,
+        config.automatic_scan,
+    )
     .context("Error reattaching to RTT after target restart")?;
     validate_channels(rtt, config)?;
     for reader in up_readers {
@@ -530,7 +634,7 @@ fn process_defmt<'table, W: Write>(
     channel: u32,
     buffered_bytes: &mut usize,
     bytes: &[u8],
-    locations: Option<&defmt_decoder::Locations>,
+    locations: Option<&'table defmt_decoder::Locations>,
     render: &mut OutputContext<'_, W>,
 ) -> Result<bool> {
     if !bytes.is_empty() && buffered_bytes.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES {
@@ -597,7 +701,7 @@ fn poll_up_channels<'table, W: Write>(
     rtt: &mut Rtt,
     core: &mut Core,
     readers: &mut [UpChannelReader<'table>],
-    locations: Option<&defmt_decoder::Locations>,
+    locations: Option<&'table defmt_decoder::Locations>,
     render: &mut OutputContext<'_, W>,
 ) -> Result<PollOutcome> {
     let mut stats = PollStats::default();
@@ -642,7 +746,7 @@ fn poll_up_channels<'table, W: Write>(
             budget -= count;
             stats.bytes += count;
             if let Some(logger) = render.logger.as_deref_mut() {
-                logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
+                logger.write_bytes(reader.spec.index, &reader.buffer[..count])?;
             }
 
             match reader.spec.mode {
@@ -892,16 +996,14 @@ fn render_terminal_event(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     if let Some(logger) = logger {
-        logger
-            .write_terminal(channel, bytes, state.channel_labels)
-            .map_err(io_error)?;
+        logger.write_chars(channel, bytes).map_err(io_error)?;
     }
     render_terminal_chunk(channel, bytes, timestamp, state, output)
 }
 
 fn render_defmt_frame(
     channel: u32,
-    frame: &DecodedFrame,
+    frame: &DecodedFrame<'_>,
     timestamp: Instant,
     filters: Option<&[Filter]>,
     state: &mut SessionState,
@@ -909,7 +1011,7 @@ fn render_defmt_frame(
     output: &mut impl Write,
 ) -> std::io::Result<()> {
     if let (Some(level), Some(filters)) = (frame.level, filters) {
-        let minimum = filter_level(frame.module.as_deref(), filters);
+        let minimum = filter_level(frame.module, filters);
         if !level_enabled(level, minimum) {
             return Ok(());
         }
@@ -928,7 +1030,7 @@ fn render_defmt_frame(
     line.push('\n');
     if let Some(logger) = logger {
         logger
-            .write_text(channel, line.as_bytes(), state.channel_labels)
+            .write_defmt_decoded(channel, line.as_bytes())
             .map_err(io_error)?;
     }
     let level_color = if state.color {
@@ -962,7 +1064,7 @@ fn render_defmt_warning(
     );
     if let Some(logger) = logger {
         logger
-            .write_text(channel, line.as_bytes(), state.channel_labels)
+            .write_defmt_decoded(channel, line.as_bytes())
             .map_err(io_error)?;
     }
     render_complete_line(channel, line.as_bytes(), timestamp, None, state, output)
@@ -1128,26 +1230,26 @@ fn dispatch_command<'table, W: Write>(
     Ok(false)
 }
 
-pub(crate) struct SessionConfig {
-    pub(crate) probe: String,
-    pub(crate) chip: String,
-    pub(crate) up_specs: Vec<ChannelSpec>,
-    pub(crate) down_channel: Option<usize>,
-    pub(crate) poll_interval: Duration,
-    pub(crate) reset: bool,
-    pub(crate) timestamps: bool,
-    pub(crate) defmt: Option<DefmtData>,
-    pub(crate) defmt_filters: Option<Vec<Filter>>,
-    pub(crate) color: crate::cli::ColorMode,
-    pub(crate) log: Option<std::path::PathBuf>,
-    pub(crate) log_per_channel: bool,
-    pub(crate) log_format: crate::cli::LogFormat,
-    pub(crate) scan_region: ScanRegion,
-    pub(crate) automatic_scan: bool,
+struct SessionConfig {
+    probe: String,
+    chip: String,
+    up_specs: Vec<ChannelSpec>,
+    down_channel: Option<usize>,
+    poll_interval: Duration,
+    reset: bool,
+    timestamps: bool,
+    defmt: Option<DefmtData>,
+    defmt_filters: Option<Vec<Filter>>,
+    color: crate::cli::ColorMode,
+    log: Option<std::path::PathBuf>,
+    log_per_channel: bool,
+    log_format: crate::cli::LogFormat,
+    scan_region: ScanRegion,
+    automatic_scan: bool,
 }
 
 impl SessionConfig {
-    pub(crate) fn from_opts(
+    fn from_opts(
         opts: Opts,
         probe: String,
         chip: String,
@@ -1194,7 +1296,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> {
+fn run_loop(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> {
     if config.reset {
         reset_and_reattach(core, &mut rtt, &config.scan_region, config.automatic_scan)?;
     }
@@ -1208,11 +1310,12 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         .map(|spec| UpChannelReader::new(spec, defmt_ref))
         .collect::<Result<Vec<_>>>()?;
 
+    let include_channel = config.up_specs.len() > 1;
     let mut logger = Logger::new(
         config.log.as_deref(),
         config.log_per_channel,
         config.log_format,
-        config.up_specs.len(),
+        include_channel,
     )?;
 
     let mut down_buf = DownBuffer::new();
@@ -1220,7 +1323,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
     let mut state = SessionState::new();
     state.timestamps = config.timestamps;
     state.interactive = std::io::stdout().is_terminal();
-    state.channel_labels = config.up_specs.len() > 1;
+    state.channel_labels = include_channel;
     state.color = match config.color {
         crate::cli::ColorMode::Always => true,
         crate::cli::ColorMode::Never => false,
@@ -1387,502 +1490,5 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::KeyEventState;
-
-    struct TestChannel(usize);
-
-    impl RttChannel for TestChannel {
-        fn number(&self) -> usize {
-            self.0
-        }
-
-        fn name(&self) -> Option<&str> {
-            None
-        }
-
-        fn buffer_size(&self) -> usize {
-            0
-        }
-    }
-
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent {
-            code,
-            modifiers,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        }
-    }
-
-    #[test]
-    fn channel_lookup_uses_rtt_number_not_slice_index() {
-        let mut channels = [TestChannel(1), TestChannel(3)];
-
-        assert_eq!(channel_by_number(&mut channels, 1).unwrap().number(), 1);
-        assert_eq!(channel_by_number(&mut channels, 3).unwrap().number(), 3);
-        assert!(channel_by_number(&mut channels, 0).is_none());
-        assert!(channel_by_number(&mut channels, 2).is_none());
-    }
-
-    #[test]
-    fn ctrl_t_enters_command_mode_without_sending() {
-        let (state, action) =
-            EscapeState::Normal.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
-
-        assert_eq!(state, EscapeState::AwaitingCommand);
-        assert_eq!(action, InputAction::Ignore);
-    }
-
-    #[test]
-    fn ctrl_t_q_quits() {
-        let (state, action) =
-            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
-
-        assert_eq!(state, EscapeState::Normal);
-        assert_eq!(action, InputAction::Command(SessionCommand::Quit));
-    }
-
-    #[test]
-    fn ctrl_t_question_requests_help() {
-        let (state, action) =
-            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('?'), KeyModifiers::SHIFT));
-
-        assert_eq!(state, EscapeState::Normal);
-        assert_eq!(action, InputAction::Command(SessionCommand::Help));
-    }
-
-    #[test]
-    fn ctrl_t_core_commands_dispatch_to_their_commands() {
-        for (character, command) in [
-            ('c', SessionCommand::ShowConfig),
-            ('l', SessionCommand::ClearScreen),
-            ('t', SessionCommand::ToggleTimestamps),
-            ('e', SessionCommand::ToggleLocalEcho),
-        ] {
-            assert_eq!(
-                EscapeState::AwaitingCommand
-                    .handle_key(key(KeyCode::Char(character), KeyModifiers::NONE)),
-                (EscapeState::Normal, InputAction::Command(command))
-            );
-        }
-
-        assert_eq!(
-            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('R'), KeyModifiers::SHIFT)),
-            (
-                EscapeState::Normal,
-                InputAction::Command(SessionCommand::ResetTarget)
-            )
-        );
-    }
-
-    #[test]
-    fn ctrl_t_ctrl_t_sends_literal_ctrl_t() {
-        let (state, action) =
-            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL));
-
-        assert_eq!(state, EscapeState::Normal);
-        assert_eq!(action, InputAction::Send(vec![0x14]));
-    }
-
-    #[test]
-    fn ctrl_c_is_forwarded_to_the_target() {
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            (EscapeState::Normal, InputAction::Send(vec![0x03]))
-        );
-    }
-
-    #[test]
-    fn ordinary_keys_keep_existing_encoding() {
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
-            (EscapeState::Normal, InputAction::Send(b"x".to_vec()))
-        );
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
-            (EscapeState::Normal, InputAction::Send(vec![b'\n']))
-        );
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Up, KeyModifiers::NONE)),
-            (EscapeState::Normal, InputAction::Send(b"\x1b[A".to_vec()))
-        );
-    }
-
-    #[test]
-    fn control_and_alt_keys_keep_terminal_encoding() {
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            (EscapeState::Normal, InputAction::Send(vec![1]))
-        );
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
-            (EscapeState::Normal, InputAction::Send(vec![21]))
-        );
-        assert_eq!(
-            EscapeState::Normal.handle_key(key(KeyCode::Char('b'), KeyModifiers::ALT)),
-            (EscapeState::Normal, InputAction::Send(b"\x1bb".to_vec()))
-        );
-    }
-
-    #[test]
-    fn repeated_keys_are_forwarded() {
-        let mut repeated = key(KeyCode::Char('x'), KeyModifiers::NONE);
-        repeated.kind = KeyEventKind::Repeat;
-
-        assert_eq!(
-            EscapeState::Normal.handle_key(repeated),
-            (EscapeState::Normal, InputAction::Send(b"x".to_vec()))
-        );
-    }
-
-    #[test]
-    fn unknown_command_keys_pass_through_and_reset_state() {
-        assert_eq!(
-            EscapeState::AwaitingCommand.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
-            (EscapeState::Normal, InputAction::Send(b"x".to_vec()))
-        );
-    }
-
-    #[test]
-    fn key_releases_do_not_change_escape_state() {
-        let mut released = key(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        released.kind = KeyEventKind::Release;
-
-        assert_eq!(
-            EscapeState::Normal.handle_key(released),
-            (EscapeState::Normal, InputAction::Ignore)
-        );
-    }
-
-    #[test]
-    fn help_lists_current_commands() {
-        let mut output = Vec::new();
-
-        write_help(&mut output).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("q  Quit"));
-        assert!(output.contains("?  Show this help"));
-        assert!(output.contains("c  Show configuration"));
-        assert!(output.contains("l  Clear screen"));
-        assert!(output.contains("t  Toggle timestamps"));
-        assert!(output.contains("e  Toggle local echo"));
-        assert!(output.contains("R  Reset target"));
-        assert!(output.contains("Ctrl-C is sent to the target"));
-        assert!(output.contains("Not implemented from tio"));
-    }
-
-    #[test]
-    fn session_banner_shows_escape_help() {
-        let mut output = Vec::new();
-
-        write_session_banner(&mut output).unwrap();
-
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("Press ctrl-t ? for help"));
-        assert!(output.contains("Connected to target"));
-    }
-
-    #[test]
-    fn timestamps_are_added_once_per_line_across_partial_events() {
-        let mut state = SessionState::new();
-        state.timestamps = true;
-        let timestamp = state.started + Duration::from_millis(123);
-        let mut output = Vec::new();
-
-        render_bytes(b"partial", timestamp, &mut state, &mut output).unwrap();
-        render_bytes(b" line\nnext", timestamp, &mut state, &mut output).unwrap();
-
-        let expected_timestamp = (state.started_wall + chrono::Duration::milliseconds(123))
-            .format("%Y-%m-%d %H:%M:%S%.3f")
-            .to_string();
-        let expected =
-            format!("[{expected_timestamp}] partial line\r\n[{expected_timestamp}] next");
-        assert_eq!(output, expected.as_bytes());
-    }
-
-    #[test]
-    fn timestamps_are_disabled_by_default() {
-        let mut state = SessionState::new();
-        let mut output = Vec::new();
-
-        render_bytes(b"text\n", Instant::now(), &mut state, &mut output).unwrap();
-
-        assert_eq!(output, b"text\r\n");
-    }
-
-    #[test]
-    fn redirected_terminal_output_buffers_fragments_until_a_complete_line() {
-        let mut state = SessionState::new();
-        state.interactive = false;
-        let mut output = Vec::new();
-        let timestamp = Instant::now();
-
-        render_terminal_chunk(0, b"partial ", timestamp, &mut state, &mut output).unwrap();
-        assert!(output.is_empty());
-
-        render_terminal_chunk(0, b"line\n", timestamp, &mut state, &mut output).unwrap();
-
-        assert_eq!(output, b"partial line\n");
-    }
-
-    #[test]
-    fn bare_carriage_return_overwrites_from_column_zero() {
-        let mut state = SessionState::new();
-        state.interactive = false;
-        let mut output = Vec::new();
-
-        render_terminal_chunk(0, b"abcdef\rxy\n", Instant::now(), &mut state, &mut output).unwrap();
-
-        assert_eq!(output, b"xycdef\n");
-    }
-
-    #[test]
-    fn toggle_status_returns_cursor_to_column_zero() {
-        let mut output = Vec::new();
-
-        write_toggle_status(&mut output, "Timestamps", true).unwrap();
-
-        assert_eq!(output, b"\r\nTimestamps: on\r\n");
-    }
-
-    #[test]
-    fn carriage_return_newline_is_not_rendered_as_two_lines() {
-        let mut state = SessionState::new();
-        state.channel_labels = true;
-        let mut output = Vec::new();
-
-        render_terminal_chunk(
-            0,
-            b"first\r\nsecond\r\n",
-            Instant::now(),
-            &mut state,
-            &mut output,
-        )
-        .unwrap();
-
-        assert_eq!(output, b"[ch0] first\r\n[ch0] second\r\n");
-    }
-
-    #[test]
-    fn completed_line_does_not_restore_its_consumed_partial_prompt() {
-        let mut state = SessionState::new();
-        state.channel_labels = true;
-        let mut output = Vec::new();
-
-        render_terminal_chunk(0, b"> ", Instant::now(), &mut state, &mut output).unwrap();
-        render_terminal_chunk(0, b"help\r\n", Instant::now(), &mut state, &mut output).unwrap();
-
-        assert_eq!(output, b"[ch0] > \r\x1b[2K[ch0] > help\r\n");
-    }
-
-    #[test]
-    fn config_and_clear_screen_outputs_include_session_settings() {
-        let config = SessionConfig {
-            probe: "probe-id".to_string(),
-            chip: "nRF52840_xxAA".to_string(),
-            up_specs: vec![ChannelSpec {
-                index: 2,
-                mode: ChannelEncoding::Terminal,
-            }],
-            down_channel: Some(1),
-            poll_interval: Duration::from_millis(10),
-            reset: false,
-            timestamps: false,
-            defmt: None,
-            defmt_filters: None,
-            color: crate::cli::ColorMode::Never,
-            log: None,
-            log_per_channel: false,
-            log_format: crate::cli::LogFormat::Decoded,
-            scan_region: ScanRegion::Exact(0x2000_0000),
-            automatic_scan: false,
-        };
-        let state = SessionState::new();
-        let mut output = Vec::new();
-
-        write_config(&config, &state, &mut output).unwrap();
-        let config_output = String::from_utf8(output).unwrap();
-        assert!(config_output.contains("Probe: probe-id"));
-        assert!(config_output.contains("Chip: nRF52840_xxAA"));
-        assert!(config_output.contains("Up channels: 2:terminal"));
-        assert!(config_output.contains("Down channel: 1"));
-        assert!(config_output.contains("Poll interval: 10 ms"));
-
-        let mut clear_output = Vec::new();
-        clear_screen(&mut clear_output).unwrap();
-        assert!(clear_output.starts_with(b"\x1b[2J"));
-    }
-
-    #[test]
-    fn terminal_chunks_are_rendered_with_channel_labels_in_read_order() {
-        let mut output = Vec::new();
-        let mut state = SessionState::new();
-        state.channel_labels = true;
-        let timestamp = Instant::now();
-
-        render_terminal_chunk(2, b"log\n", timestamp, &mut state, &mut output).unwrap();
-        render_terminal_chunk(0, b"shell", timestamp, &mut state, &mut output).unwrap();
-
-        assert_eq!(output, b"[ch2] log\r\n[ch0] shell");
-    }
-
-    #[test]
-    fn multiple_channels_are_labeled_on_each_line() {
-        let mut output = Vec::new();
-        let mut state = SessionState::new();
-        state.channel_labels = true;
-        let timestamp = Instant::now();
-
-        render_terminal_chunk(0, b"zero\none", timestamp, &mut state, &mut output).unwrap();
-        render_terminal_chunk(1, b"one\n", timestamp, &mut state, &mut output).unwrap();
-
-        assert_eq!(
-            output,
-            b"[ch0] zero\r\n[ch0] one\r\x1b[2K[ch1] one\r\n[ch0] one"
-        );
-    }
-
-    #[test]
-    fn channel_labels_use_stable_palette_colors() {
-        assert_eq!(channel_color(0), "\x1b[36m");
-        assert_eq!(channel_color(6), channel_color(0));
-
-        let mut output = Vec::new();
-        let mut state = SessionState::new();
-        state.channel_labels = true;
-        state.color = true;
-
-        render_terminal_chunk(1, b"line\n", Instant::now(), &mut state, &mut output).unwrap();
-
-        assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\r\n");
-    }
-
-    #[test]
-    fn defmt_level_color_composes_after_channel_color() {
-        let frame = DecodedFrame {
-            message: "bad".to_string(),
-            timestamp: None,
-            level: Some(defmt_parser::Level::Error),
-            module: None,
-        };
-        let mut output = Vec::new();
-        let mut state = SessionState::new();
-        state.channel_labels = true;
-        state.color = true;
-
-        render_defmt_frame(
-            1,
-            &frame,
-            Instant::now(),
-            None,
-            &mut state,
-            None,
-            &mut output,
-        )
-        .unwrap();
-
-        assert_eq!(output, b"\x1b[35m[ch1] \x1b[0m\x1b[31merror bad\r\n\x1b[0m");
-    }
-
-    #[test]
-    fn filtered_defmt_frames_are_not_rendered_or_logged() {
-        let frame = DecodedFrame {
-            message: "quiet".to_string(),
-            timestamp: None,
-            level: Some(defmt_parser::Level::Info),
-            module: Some("app".to_string()),
-        };
-        let filters = vec![Filter {
-            module: "".into(),
-            level: defmt_parser::Level::Warn,
-        }];
-        let mut output = Vec::new();
-        let mut state = SessionState::new();
-
-        render_defmt_frame(
-            0,
-            &frame,
-            Instant::now(),
-            Some(&filters),
-            &mut state,
-            None,
-            &mut output,
-        )
-        .unwrap();
-
-        assert!(output.is_empty());
-        assert_eq!(state.defmt_decode_warnings, 0);
-    }
-
-    #[test]
-    fn reset_target_clears_renderer_state_and_queued_input() {
-        let mut state = SessionState::new();
-        state.line_start = false;
-        state.last_channel = Some(1);
-        state.foreground = Some(ForegroundLine {
-            channel: 1,
-            bytes: b"> ".to_vec(),
-        });
-        state.streams.insert(1, SessionStream::new());
-
-        state.reset_target();
-
-        assert!(state.line_start);
-        assert_eq!(state.last_channel, None);
-        assert!(state.foreground.is_none());
-        assert!(state.streams.is_empty());
-
-        let mut down = DownBuffer::new();
-        down.push(b"typed but unsent");
-        down.clear();
-        assert!(down.is_empty());
-    }
-
-    #[test]
-    fn down_buffer_caps_growth_and_drops_excess() {
-        let mut down = DownBuffer::new();
-        let chunk = vec![b'x'; MAX_DOWN_BUFFER_BYTES + 32];
-
-        down.push(&chunk);
-
-        assert_eq!(down.bytes.len(), MAX_DOWN_BUFFER_BYTES);
-        assert_eq!(down.dropped, 32);
-        assert_eq!(down.writable().len(), MAX_DOWN_BUFFER_BYTES);
-
-        down.consume(16);
-        assert_eq!(down.bytes.len(), MAX_DOWN_BUFFER_BYTES - 16);
-    }
-
-    #[test]
-    fn terminal_lines_are_bounded_instead_of_growing_without_bound() {
-        let mut state = SessionState::new();
-        state.interactive = false;
-        let mut output = Vec::new();
-        let long = vec![b'a'; 16 * 1024 + 64];
-
-        render_terminal_chunk(0, &long, Instant::now(), &mut state, &mut output).unwrap();
-        render_terminal_chunk(0, b"\n", Instant::now(), &mut state, &mut output).unwrap();
-
-        assert_eq!(output.len(), 4097);
-    }
-
-    #[test]
-    fn terminal_output_preserves_sgr_colors_without_cursor_rewrites() {
-        let mut state = SessionState::new();
-        let mut output = Vec::new();
-
-        render_terminal_chunk(
-            0,
-            b"\x1b[31mred\x1b[0m\n",
-            Instant::now(),
-            &mut state,
-            &mut output,
-        )
-        .unwrap();
-
-        assert_eq!(output, b"\x1b[31mred\x1b[0m\r\n");
-    }
-}
+#[path = "../tests/session.rs"]
+mod tests;
