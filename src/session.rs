@@ -892,7 +892,7 @@ fn render_terminal_event(
 ) -> std::io::Result<()> {
     if let Some(logger) = logger {
         logger
-            .write_terminal(channel, bytes, state.channel_labels)
+            .write_terminal(channel, bytes, state.channel_labels, timestamp)
             .map_err(io_error)?;
     }
     render_terminal_chunk(channel, bytes, timestamp, state, output)
@@ -927,7 +927,7 @@ fn render_defmt_frame(
     line.push('\n');
     if let Some(logger) = logger {
         logger
-            .write_text(channel, line.as_bytes(), state.channel_labels)
+            .write_text(channel, line.as_bytes(), state.channel_labels, timestamp)
             .map_err(io_error)?;
     }
     let level_color = if state.color {
@@ -961,7 +961,7 @@ fn render_defmt_warning(
     );
     if let Some(logger) = logger {
         logger
-            .write_text(channel, line.as_bytes(), state.channel_labels)
+            .write_text(channel, line.as_bytes(), state.channel_labels, timestamp)
             .map_err(io_error)?;
     }
     render_complete_line(channel, line.as_bytes(), timestamp, None, state, output)
@@ -1079,8 +1079,12 @@ fn dispatch_command<'table, W: Write>(
             render.state.line_start = true;
         }
         SessionCommand::ToggleTimestamps => {
-            render.state.timestamps = !render.state.timestamps;
-            write_toggle_status(render.output, "Timestamps", render.state.timestamps)?;
+            let enabled = !render.state.timestamps;
+            render.state.timestamps = enabled;
+            if let Some(logger) = render.logger.as_deref_mut() {
+                logger.set_timestamps(enabled);
+            }
+            write_toggle_status(render.output, "Timestamps", enabled)?;
             render.output.flush()?;
             render.state.line_start = true;
         }
@@ -1173,6 +1177,9 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         config.log_format,
         config.up_specs.len(),
     )?;
+    if let Some(logger) = logger.as_mut() {
+        logger.set_timestamps(config.timestamps);
+    }
 
     let mut down_buf = DownBuffer::new();
     let mut escape_state = EscapeState::Normal;

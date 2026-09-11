@@ -1,10 +1,12 @@
 use crate::cli::LogFormat;
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Local};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
@@ -16,6 +18,9 @@ pub(crate) struct Logger {
     channels: HashMap<u32, BufWriter<File>>,
     streams: HashMap<u32, DecodedStream>,
     text_pending: HashMap<u32, (Vec<u8>, bool)>,
+    timestamps: bool,
+    started: Instant,
+    started_wall: DateTime<Local>,
 }
 
 pub(crate) struct DecodedStream {
@@ -54,11 +59,28 @@ impl Logger {
             channels: HashMap::new(),
             streams: HashMap::new(),
             text_pending: HashMap::new(),
+            timestamps: false,
+            started: Instant::now(),
+            started_wall: Local::now(),
         };
         if !per_channel {
             logger.merged = Some(BufWriter::new(open_log(path)?));
         }
         Ok(Some(logger))
+    }
+
+    /// Enables or disables timestamp prefixes for decoded log lines.
+    ///
+    /// Raw logs always preserve the exact RTT bytes and are not affected.
+    pub(crate) fn set_timestamps(&mut self, enabled: bool) {
+        self.timestamps = enabled;
+    }
+
+    fn timestamp_prefix(&self, timestamp: Instant) -> String {
+        let elapsed = timestamp.saturating_duration_since(self.started);
+        let wall = self.started_wall
+            + chrono::Duration::from_std(elapsed).unwrap_or_else(|_| chrono::Duration::zero());
+        format!("[{}] ", wall.format("%Y-%m-%d %H:%M:%S%.3f"))
     }
 
     fn file_for_channel(&mut self, channel: u32) -> Result<&mut BufWriter<File>> {
@@ -91,6 +113,7 @@ impl Logger {
         channel: u32,
         bytes: &[u8],
         include_channel: bool,
+        timestamp: Instant,
     ) -> Result<()> {
         if self.format != LogFormat::Decoded || bytes.is_empty() {
             return Ok(());
@@ -112,9 +135,13 @@ impl Logger {
             return Ok(());
         }
         let tag = include_channel.then(|| format!("[ch{channel}] "));
+        let prefix = self.timestamps.then(|| self.timestamp_prefix(timestamp));
         {
             let file = self.file_for_channel(channel)?;
             for line in &complete {
+                if let Some(prefix) = &prefix {
+                    file.write_all(prefix.as_bytes())?;
+                }
                 if let Some(tag) = &tag {
                     file.write_all(tag.as_bytes())?;
                 }
@@ -129,6 +156,7 @@ impl Logger {
         channel: u32,
         bytes: &[u8],
         include_channel: bool,
+        timestamp: Instant,
     ) -> Result<()> {
         if self.format != LogFormat::Decoded || bytes.is_empty() {
             return Ok(());
@@ -146,10 +174,14 @@ impl Logger {
         let has_complete_line = memchr::memchr(b'\n', &pending).is_some();
         if has_complete_line {
             let tag = include_channel.then(|| format!("[ch{channel}] "));
+            let prefix = self.timestamps.then(|| self.timestamp_prefix(timestamp));
             {
                 let file = self.file_for_channel(channel)?;
                 while let Some(offset) = memchr::memchr(b'\n', &pending[start..]) {
                     let end = start + offset + 1;
+                    if let Some(prefix) = &prefix {
+                        file.write_all(prefix.as_bytes())?;
+                    }
                     if let Some(tag) = &tag {
                         file.write_all(tag.as_bytes())?;
                     }
@@ -169,6 +201,9 @@ impl Logger {
 
     /// Writes any buffered partial lines and flushes the log files.
     pub(crate) fn flush(&mut self) -> Result<()> {
+        let prefix = self
+            .timestamps
+            .then(|| self.timestamp_prefix(Instant::now()));
         let stream_tails: Vec<_> = self
             .streams
             .iter()
@@ -180,6 +215,9 @@ impl Logger {
         for (channel, include_channel, line) in stream_tails {
             let tag = include_channel.then(|| format!("[ch{channel}] "));
             let file = self.file_for_channel(channel)?;
+            if let Some(prefix) = &prefix {
+                file.write_all(prefix.as_bytes())?;
+            }
             if let Some(tag) = &tag {
                 file.write_all(tag.as_bytes())?;
             }
@@ -196,6 +234,9 @@ impl Logger {
         for (channel, include_channel, bytes) in text_tails {
             let tag = include_channel.then(|| format!("[ch{channel}] "));
             let file = self.file_for_channel(channel)?;
+            if let Some(prefix) = &prefix {
+                file.write_all(prefix.as_bytes())?;
+            }
             if let Some(tag) = &tag {
                 file.write_all(tag.as_bytes())?;
             }
@@ -221,6 +262,9 @@ impl Logger {
     /// Used when the target restarts so output from a new boot is not merged
     /// with the previous session's partial line.
     pub(crate) fn reset(&mut self) -> Result<()> {
+        let prefix = self
+            .timestamps
+            .then(|| self.timestamp_prefix(Instant::now()));
         let stream_tails: Vec<_> = self
             .streams
             .iter()
@@ -232,6 +276,9 @@ impl Logger {
         for (channel, include_channel, line) in stream_tails {
             let tag = include_channel.then(|| format!("[ch{channel}] "));
             let file = self.file_for_channel(channel)?;
+            if let Some(prefix) = &prefix {
+                file.write_all(prefix.as_bytes())?;
+            }
             if let Some(tag) = &tag {
                 file.write_all(tag.as_bytes())?;
             }
@@ -249,6 +296,9 @@ impl Logger {
         for (channel, include_channel, bytes) in text_tails {
             let tag = include_channel.then(|| format!("[ch{channel}] "));
             let file = self.file_for_channel(channel)?;
+            if let Some(prefix) = &prefix {
+                file.write_all(prefix.as_bytes())?;
+            }
             if let Some(tag) = &tag {
                 file.write_all(tag.as_bytes())?;
             }
@@ -426,7 +476,7 @@ fn channel_path(path: &Path, channel: u32) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn test_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -436,6 +486,16 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn timestamp_at(logger: &Logger, offset_ms: i64) -> (String, Instant) {
+        let timestamp = logger.started + Duration::from_millis(offset_ms as u64);
+        let prefix = format!(
+            "[{}] ",
+            (logger.started_wall + chrono::Duration::milliseconds(offset_ms))
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+        );
+        (prefix, timestamp)
     }
 
     #[test]
@@ -472,8 +532,12 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 2)
             .unwrap()
             .unwrap();
-        logger.write_text(0, b"one\n", true).unwrap();
-        logger.write_text(1, b"two\n", true).unwrap();
+        logger
+            .write_text(0, b"one\n", true, Instant::now())
+            .unwrap();
+        logger
+            .write_text(1, b"two\n", true, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"[ch0] one\n[ch1] two\n");
         fs::remove_file(path).unwrap();
@@ -491,9 +555,11 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 2)
             .unwrap()
             .unwrap();
-        logger.write_text(0, b"foo", true).unwrap();
-        logger.write_text(1, b"bar\n", true).unwrap();
-        logger.write_text(0, b"\n", true).unwrap();
+        logger.write_text(0, b"foo", true, Instant::now()).unwrap();
+        logger
+            .write_text(1, b"bar\n", true, Instant::now())
+            .unwrap();
+        logger.write_text(0, b"\n", true, Instant::now()).unwrap();
         logger.flush().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"[ch1] bar\n[ch0] foo\n");
         fs::remove_file(path).unwrap();
@@ -518,7 +584,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), true, LogFormat::Decoded, 2)
             .unwrap()
             .unwrap();
-        logger.write_text(1, b"message\n", false).unwrap();
+        logger
+            .write_text(1, b"message\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         let channel_path = channel_path(&path, 1);
@@ -532,7 +600,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_text(0, b"unfinished", false).unwrap();
+        logger
+            .write_text(0, b"unfinished", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"unfinished");
@@ -546,7 +616,12 @@ mod tests {
             .unwrap()
             .unwrap();
         logger
-            .write_terminal(0, b"\r\x1b[2K> help\r\x1b[2K> \r\x1b[2K> help\r\n", false)
+            .write_terminal(
+                0,
+                b"\r\x1b[2K> help\r\x1b[2K> \r\x1b[2K> help\r\n",
+                false,
+                Instant::now(),
+            )
             .unwrap();
         logger.flush().unwrap();
 
@@ -560,8 +635,12 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, b"old\r\x1b[", false).unwrap();
-        logger.write_terminal(0, b"2Knew\n", false).unwrap();
+        logger
+            .write_terminal(0, b"old\r\x1b[", false, Instant::now())
+            .unwrap();
+        logger
+            .write_terminal(0, b"2Knew\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"new\n");
@@ -574,7 +653,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, b"> pwd\r\n", false).unwrap();
+        logger
+            .write_terminal(0, b"> pwd\r\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"> pwd\n");
@@ -587,7 +668,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, b"abc\x1b[1GX\n", false).unwrap();
+        logger
+            .write_terminal(0, b"abc\x1b[1GX\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"Xbc\n");
@@ -601,7 +684,7 @@ mod tests {
             .unwrap()
             .unwrap();
         logger
-            .write_terminal(0, b"abcdefghij\x1b[3G\t\n", false)
+            .write_terminal(0, b"abcdefghij\x1b[3G\t\n", false, Instant::now())
             .unwrap();
         logger.flush().unwrap();
 
@@ -615,7 +698,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_text(0, b"value: \x1b[2K\n", false).unwrap();
+        logger
+            .write_text(0, b"value: \x1b[2K\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"value: \x1b[2K\n");
@@ -628,7 +713,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, "ż界\n".as_bytes(), false).unwrap();
+        logger
+            .write_terminal(0, "ż界\n".as_bytes(), false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), "ż界\n".as_bytes());
@@ -642,7 +729,7 @@ mod tests {
             .unwrap()
             .unwrap();
         logger
-            .write_terminal(0, "e\u{301}\n".as_bytes(), false)
+            .write_terminal(0, "e\u{301}\n".as_bytes(), false, Instant::now())
             .unwrap();
         logger.flush().unwrap();
 
@@ -656,7 +743,9 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, b"abc\x1b[1K\n", false).unwrap();
+        logger
+            .write_terminal(0, b"abc\x1b[1K\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"\n");
@@ -669,9 +758,13 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, b"old\r\x1b[", false).unwrap();
+        logger
+            .write_terminal(0, b"old\r\x1b[", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
-        logger.write_terminal(0, b"2Knew\n", false).unwrap();
+        logger
+            .write_terminal(0, b"2Knew\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"oldnew\n");
@@ -684,12 +777,125 @@ mod tests {
         let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
             .unwrap()
             .unwrap();
-        logger.write_terminal(0, b"boot", false).unwrap();
+        logger
+            .write_terminal(0, b"boot", false, Instant::now())
+            .unwrap();
         logger.reset().unwrap();
-        logger.write_terminal(0, b"next\n", false).unwrap();
+        logger
+            .write_terminal(0, b"next\n", false, Instant::now())
+            .unwrap();
         logger.flush().unwrap();
 
         assert_eq!(fs::read(&path).unwrap(), b"boot\nnext\n");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn merged_decoded_logs_get_timestamps_before_channel_tags() {
+        let path = test_path("merged-timestamps");
+        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 2)
+            .unwrap()
+            .unwrap();
+        logger.set_timestamps(true);
+        let (prefix, timestamp) = timestamp_at(&logger, 250);
+        logger.write_text(0, b"one\n", true, timestamp).unwrap();
+        logger.write_text(1, b"two\n", true, timestamp).unwrap();
+        logger.flush().unwrap();
+
+        let expected = format!("{prefix}[ch0] one\n{prefix}[ch1] two\n");
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn per_channel_decoded_logs_get_timestamps() {
+        let path = test_path("decoded-per-channel-timestamps.log");
+        let mut logger = Logger::new(Some(&path), true, LogFormat::Decoded, 2)
+            .unwrap()
+            .unwrap();
+        logger.set_timestamps(true);
+        let (prefix, timestamp) = timestamp_at(&logger, 100);
+        logger
+            .write_text(1, b"message\n", false, timestamp)
+            .unwrap();
+        logger.flush().unwrap();
+
+        let channel_path = channel_path(&path, 1);
+        let expected = format!("{prefix}message\n");
+        assert_eq!(fs::read(&channel_path).unwrap(), expected.as_bytes());
+        fs::remove_file(channel_path).unwrap();
+    }
+
+    #[test]
+    fn timestamp_toggle_applies_to_subsequent_lines_only() {
+        let path = test_path("timestamp-toggle");
+        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
+            .unwrap()
+            .unwrap();
+        let (prefix, timestamp) = timestamp_at(&logger, 123);
+        logger.write_text(0, b"before\n", false, timestamp).unwrap();
+        logger.set_timestamps(true);
+        logger.write_text(0, b"during\n", false, timestamp).unwrap();
+        logger.set_timestamps(false);
+        logger.write_text(0, b"after\n", false, timestamp).unwrap();
+        logger.flush().unwrap();
+
+        let expected = format!("before\n{prefix}during\nafter\n");
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn raw_logs_ignore_timestamps() {
+        let path = test_path("raw-timestamps.log");
+        let mut logger = Logger::new(Some(&path), true, LogFormat::Raw, 1)
+            .unwrap()
+            .unwrap();
+        logger.set_timestamps(true);
+        logger.write_raw(0, &[0, 1, b'\n', 0xff]).unwrap();
+        logger.flush().unwrap();
+
+        let channel_path = channel_path(&path, 0);
+        assert_eq!(fs::read(&channel_path).unwrap(), &[0, 1, b'\n', 0xff]);
+        fs::remove_file(channel_path).unwrap();
+    }
+
+    #[test]
+    fn decoded_terminal_logs_get_timestamps() {
+        let path = test_path("terminal-timestamps");
+        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
+            .unwrap()
+            .unwrap();
+        logger.set_timestamps(true);
+        let (prefix, timestamp) = timestamp_at(&logger, 42);
+        logger
+            .write_terminal(0, b"boot\n", false, timestamp)
+            .unwrap();
+        logger.flush().unwrap();
+
+        let expected = format!("{prefix}boot\n");
+        assert_eq!(fs::read(&path).unwrap(), expected.as_bytes());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn flush_timestamps_an_unfinished_decoded_line() {
+        let path = test_path("timestamp-tail");
+        let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, 1)
+            .unwrap()
+            .unwrap();
+        logger.set_timestamps(true);
+        logger
+            .write_text(0, b"unfinished", false, Instant::now())
+            .unwrap();
+        logger.flush().unwrap();
+
+        let content = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        assert!(content.starts_with('['), "missing timestamp in {content:?}");
+        assert!(
+            content.ends_with("] unfinished"),
+            "unexpected tail in {content:?}"
+        );
         fs::remove_file(path).unwrap();
     }
 }

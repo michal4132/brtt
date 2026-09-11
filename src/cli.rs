@@ -164,7 +164,7 @@ pub(crate) struct Opts {
     #[clap(
         short = 't',
         long = "timestamp",
-        help = "Enable local date and time timestamps with millisecond precision."
+        help = "Enable local date and time timestamps with millisecond precision in terminal output and decoded logs. Raw logs always keep exact RTT bytes."
     )]
     pub(crate) timestamps: bool,
 

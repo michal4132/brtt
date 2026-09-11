@@ -17,7 +17,7 @@ brtt [OPTIONS]
 - `-d, --down <CHANNEL>`: The RTT "down" channel (host to target) for keyboard input. Only one channel is supported and it defaults to channel 0.
 - `--no-down`: Disable the default down channel and keyboard input for output-only sessions.
 - `-r, --reset`: Reset the target after opening the RTT session.
-- `-t, --timestamp`: Enable local date and time timestamps with millisecond precision. `Ctrl-T t` toggles them during a session.
+- `-t, --timestamp`: Enable local date and time timestamps with millisecond precision in terminal output and decoded logs. `Ctrl-T t` toggles them during a session. Raw logs always keep exact RTT bytes and are never timestamped.
 - `--poll-interval <MILLISECONDS>`: Polling interval for RTT and keyboard input. [default: 10]
 - `--scan-region <SCAN_REGION>`: Specify a memory region to scan for the RTT control block. Can be an exact address (e.g., `0x20000000`) or a range (e.g., `0x20000000..0x20010000`).
 - `--elf <PATH>`: ELF containing a defined `_SEGGER_RTT` symbol and, optionally, a defmt table. Required for `:defmt` channels; its symbol takes precedence over `--scan-region`.
@@ -26,7 +26,7 @@ brtt [OPTIONS]
 - `--color <auto|always|never>`: Select terminal coloring for channel labels and defmt levels.
 - `-L, --log <PATH>`: Write session output to a log file.
 - `--log-per-channel`: Write separate `.chN` files instead of one merged log.
-- `--log-format <decoded|raw>`: Log cleaned terminal text or exact RTT bytes. Decoded logs retain echoed commands while removing terminal redraw controls; raw merged logs require a single up channel.
+- `--log-format <decoded|raw>`: Log cleaned terminal text or exact RTT bytes. Decoded logs retain echoed commands while removing terminal redraw controls and gain timestamp prefixes when timestamps are enabled; raw merged logs require a single up channel and are never timestamped.
 
 ### Example: nRF54L15 with two up channels
 
@@ -50,7 +50,7 @@ Internal diagnostics are written to stderr and warnings are shown by default. Se
 
 Defmt filters apply only to frames already sent by the target. A module-specific filter changes that module while leaving other modules unchanged: `app=debug` shows debug-or-higher messages from `app` and leaves other modules at their normal level. Use `warn,app=debug` for a warning threshold globally with a more verbose `app` override.
 
-Decoded terminal logs use a stateful ANSI/UTF-8 terminal model: they interpret carriage returns, backspaces, tabs, cursor movement, and erase-line sequences while retaining echoed commands. Defmt logs remain formatted text and are not terminal-emulated. Incomplete lines are buffered until a newline is received and flushed when the session exits normally or reports an error. If the target restarts, `brtt` reattaches to RTT, finalizes the previous partial line, and discards queued keyboard input before continuing. Raw logs preserve the exact RTT bytes, including malformed defmt data.
+Decoded terminal logs use a stateful ANSI/UTF-8 terminal model: they interpret carriage returns, backspaces, tabs, cursor movement, and erase-line sequences while retaining echoed commands. Defmt logs remain formatted text and are not terminal-emulated. Incomplete lines are buffered until a newline is received and flushed when the session exits normally or reports an error. If the target restarts, `brtt` reattaches to RTT, finalizes the previous partial line, and discards queued keyboard input before continuing. Raw logs preserve the exact RTT bytes, including malformed defmt data, and are never timestamped.
 
 ## Nix
 
