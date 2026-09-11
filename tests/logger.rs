@@ -234,6 +234,19 @@ fn terminal_logger_erases_the_cursor_cell_with_csi_one_k() {
 }
 
 #[test]
+fn terminal_logger_deletes_characters_with_csi_p() {
+    let path = test_path("terminal-delete-char");
+    let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)
+        .unwrap()
+        .unwrap();
+    logger.write_chars(0, b"abc\x1b[D\x1b[P\n").unwrap();
+    logger.flush().unwrap();
+
+    assert_eq!(fs::read(&path).unwrap(), b"ab\n");
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn terminal_logger_flush_preserves_parser_state() {
     let path = test_path("terminal-flush-state");
     let mut logger = Logger::new(Some(&path), false, LogFormat::Decoded, false)

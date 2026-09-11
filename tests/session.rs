@@ -116,15 +116,23 @@ fn ordinary_keys_keep_existing_encoding() {
     );
     assert_eq!(
         EscapeState::Normal.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE)),
-        (EscapeState::Normal, InputAction::Send(vec![8]))
-    );
-    assert_eq!(
-        EscapeState::Normal.handle_key(key(KeyCode::Delete, KeyModifiers::NONE)),
-        (EscapeState::Normal, InputAction::Send(b"\x1b[3~".to_vec()))
+        (EscapeState::Normal, InputAction::Send(vec![0x7f]))
     );
     assert_eq!(
         EscapeState::Normal.handle_key(key(KeyCode::Up, KeyModifiers::NONE)),
         (EscapeState::Normal, InputAction::Send(b"\x1b[A".to_vec()))
+    );
+    assert_eq!(
+        EscapeState::Normal.handle_key(key(KeyCode::Down, KeyModifiers::NONE)),
+        (EscapeState::Normal, InputAction::Send(b"\x1b[B".to_vec()))
+    );
+    assert_eq!(
+        EscapeState::Normal.handle_key(key(KeyCode::Left, KeyModifiers::NONE)),
+        (EscapeState::Normal, InputAction::Send(b"\x1b[D".to_vec()))
+    );
+    assert_eq!(
+        EscapeState::Normal.handle_key(key(KeyCode::Right, KeyModifiers::NONE)),
+        (EscapeState::Normal, InputAction::Send(b"\x1b[C".to_vec()))
     );
 }
 
@@ -189,7 +197,6 @@ fn help_lists_current_commands() {
     assert!(output.contains("e  Toggle local echo"));
     assert!(output.contains("R  Reset target"));
     assert!(output.contains("Ctrl-C is sent to the target"));
-    assert!(output.contains("Not implemented from tio"));
 }
 
 #[test]

@@ -17,7 +17,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use probe_rs::Core;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{stdout, BufWriter, IsTerminal};
 use std::time::{Duration, Instant};
@@ -132,6 +132,10 @@ impl SessionStream {
         (complete, self.visible_line())
     }
 
+    fn raw_visible_line(&self) -> Vec<u8> {
+        self.raw_line.clone()
+    }
+
     fn visible_line(&self) -> Vec<u8> {
         if self.raw_rewrite {
             self.terminal.visible_line()
@@ -201,7 +205,7 @@ impl SessionStream {
 }
 
 struct DownBuffer {
-    bytes: VecDeque<u8>,
+    bytes: Vec<u8>,
     dropped: u64,
 }
 
@@ -216,7 +220,7 @@ struct OutputContext<'a, W: Write> {
 impl DownBuffer {
     fn new() -> Self {
         Self {
-            bytes: VecDeque::new(),
+            bytes: Vec::new(),
             dropped: 0,
         }
     }
@@ -246,8 +250,7 @@ impl DownBuffer {
     }
 
     fn writable(&mut self) -> &mut [u8] {
-        let (head, _) = self.bytes.as_mut_slices();
-        head
+        &mut self.bytes
     }
 
     fn consume(&mut self, count: usize) {
@@ -418,8 +421,7 @@ fn key_to_action(key: KeyEvent) -> InputAction {
         KeyCode::Char(c) => push_char(&mut bytes, c),
         KeyCode::Enter => bytes.push(b'\n'),
         KeyCode::Tab => bytes.push(b'\t'),
-        KeyCode::Backspace => bytes.push(8u8),
-        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::Backspace => bytes.push(0x7f),
         KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
         KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
         KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
@@ -912,15 +914,15 @@ fn render_terminal_chunk(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    let complete = {
+    let (complete, partial, raw_partial) = {
         let stream = state
             .streams
             .entry(channel)
             .or_insert_with(SessionStream::new);
-        stream.consume(bytes)
+        let (complete, partial) = stream.consume(bytes);
+        (complete, partial, stream.raw_visible_line())
     };
 
-    let (complete, partial) = complete;
     for line in complete {
         let foreground = erase_foreground(state, output)?;
         render_channel_bytes(&line, Some(channel), timestamp, state, output)?;
@@ -939,13 +941,13 @@ fn render_terminal_chunk(
     }
 
     if state.interactive {
-        let partial = (!partial.is_empty()).then_some(partial);
-        if let Some(partial) = partial {
+        if !partial.is_empty() {
             if state.foreground.as_ref().map(|line| line.channel) == Some(channel) {
                 erase_foreground(state, output)?;
             } else if state.foreground.is_some() {
                 return Ok(());
             }
+            let partial = raw_partial;
             render_channel_bytes(&partial, Some(channel), timestamp, state, output)?;
             state.foreground = Some(ForegroundLine {
                 channel,
@@ -1086,7 +1088,7 @@ fn io_error(error: anyhow::Error) -> std::io::Error {
 fn write_help(output: &mut impl Write) -> std::io::Result<()> {
     write!(
         output,
-        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  e  Toggle local echo\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\nNot implemented from tio (not applicable to RTT):\r\n  serial port settings, device auto-connect/reconnect, input/output hex modes,\r\n  output delays, character mapping, scripts, socket/exec redirection, RS-485,\r\n  connect alerts, and tio-specific log file options.\r\n"
+        "\r\nCtrl-T commands:\r\n  q  Quit\r\n  ?  Show this help\r\n  c  Show configuration\r\n  l  Clear screen\r\n  t  Toggle timestamps\r\n  e  Toggle local echo\r\n  R  Reset target\r\n  Ctrl-T  Send a literal Ctrl-T\r\n\r\nCtrl-C is sent to the target.\r\n\r\n"
     )?;
     output.flush()
 }
@@ -1483,6 +1485,10 @@ fn run_loop(core: &mut Core, mut rtt: Rtt, config: SessionConfig) -> Result<()> 
         }
     };
 
+    if state.interactive {
+        output.write_all(b"\x1b[0m\r\x1b[2K\r\n")?;
+        output.flush()?;
+    }
     if let Some(logger) = &mut logger {
         logger.flush()?;
     }

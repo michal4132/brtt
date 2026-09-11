@@ -354,6 +354,12 @@ impl Perform for DecodedStream {
                 self.complete.push(line);
             }
             8 => self.cursor = self.cursor.saturating_sub(1),
+            b'P' => {
+                let cursor = self.cursor.min(self.line.len());
+                if cursor < self.line.len() {
+                    self.line.remove(cursor);
+                }
+            }
             b'\t' => {
                 self.cursor = self
                     .cursor
@@ -385,14 +391,20 @@ impl Perform for DecodedStream {
                 2 => self.line.clear(),
                 _ => {}
             },
-            'G' | '`' => self.cursor = value().saturating_sub(1).min(MAX_TERMINAL_COLUMNS),
+            'P' => {
+                let start = self.cursor.min(self.line.len());
+                let count = if params.is_empty() { 1 } else { value().max(1) }
+                    .min(self.line.len().saturating_sub(start));
+                self.line.drain(start..start + count);
+            }
+            'G' | '`' => self.cursor = value().max(1).saturating_sub(1).min(MAX_TERMINAL_COLUMNS),
             'C' => {
                 self.cursor = self
                     .cursor
-                    .saturating_add(value())
+                    .saturating_add(value().max(1))
                     .min(MAX_TERMINAL_COLUMNS)
             }
-            'D' => self.cursor = self.cursor.saturating_sub(value()),
+            'D' => self.cursor = self.cursor.saturating_sub(value().max(1)),
             _ => {}
         }
     }
