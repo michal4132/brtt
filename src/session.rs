@@ -1,4 +1,4 @@
-use crate::cli::{ChannelEncoding, ChannelSpec};
+use crate::cli::{ChannelEncoding, ChannelSpec, Opts};
 use crate::defmt::{
     decode_frames, filter_level, level_enabled, level_name, DecodeOutput, DecodedFrame, DefmtData,
     Filter, MAX_DECODE_BUFFERED_BYTES,
@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 
 const RTT_REATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_HALT_TIMEOUT: Duration = Duration::from_millis(100);
-const UP_CHANNEL_BUFFER_SIZE: usize = 4096;
-const RTT_READ_BUDGET_PER_POLL: usize = 64 * 1024;
+const UP_CHANNEL_BUFFER_SIZE: usize = 4 * 1024;
+const MAX_RTT_READS_PER_POLL: usize = 16;
+const RTT_READ_BUDGET_PER_POLL: usize = UP_CHANNEL_BUFFER_SIZE * MAX_RTT_READS_PER_POLL;
 const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_SESSION_RAW_LINE_BYTES: usize = 4096;
 
@@ -1143,6 +1144,46 @@ pub(crate) struct SessionConfig {
     pub(crate) log_format: crate::cli::LogFormat,
     pub(crate) scan_region: ScanRegion,
     pub(crate) automatic_scan: bool,
+}
+
+impl SessionConfig {
+    pub(crate) fn from_opts(
+        opts: Opts,
+        probe: String,
+        chip: String,
+        defmt: Option<DefmtData>,
+        scan_region: ScanRegion,
+        automatic_scan: bool,
+    ) -> Result<Self> {
+        let down_channel = if opts.no_down {
+            None
+        } else {
+            Some(
+                opts.down
+                    .unwrap_or(0)
+                    .try_into()
+                    .context("down channel index cannot be represented on this host")?,
+            )
+        };
+
+        Ok(Self {
+            probe,
+            chip,
+            up_specs: crate::cli::configured_up_specs(&opts.up),
+            down_channel,
+            poll_interval: Duration::from_millis(opts.poll_interval),
+            reset: opts.reset,
+            timestamps: opts.timestamps,
+            defmt,
+            defmt_filters: opts.defmt_filters.map(|spec| spec.0),
+            color: opts.color,
+            log: opts.log,
+            log_per_channel: opts.log_per_channel,
+            log_format: opts.log_format.unwrap_or(crate::cli::LogFormat::Decoded),
+            scan_region,
+            automatic_scan,
+        })
+    }
 }
 
 struct RawModeGuard;
