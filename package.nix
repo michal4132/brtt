@@ -6,9 +6,22 @@ rustPlatform.buildRustPackage {
   pname = "brtt";
   version = "0.1.5";
 
-  src = lib.cleanSource ./.;
+  src = lib.cleanSourceWith {
+    src = ./.;
+    filter = path: type:
+      let
+        name = baseNameOf path;
+      in
+        name != "target"
+        && name != ".direnv"
+        && name != "result"
+        && name != "result-bin";
+  };
 
   cargoLock.lockFile = ./Cargo.lock;
+
+  # Tests are run separately; avoid rebuilding test artifacts during packaging.
+  doCheck = false;
 
   meta = {
     description = "A command-line RTT client";
