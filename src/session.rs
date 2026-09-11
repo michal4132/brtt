@@ -305,7 +305,7 @@ fn poll_up_channels(
                 logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
             }
             match reader.spec.mode {
-                ChannelEncoding::Ascii => events.push(ChannelEvent {
+                ChannelEncoding::Terminal => events.push(ChannelEvent {
                     channel_idx: reader.spec.index,
                     payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
                     timestamp,
@@ -449,7 +449,7 @@ fn render_channel_bytes_colored_inner(
     Ok(())
 }
 
-fn render_ascii_chunk(
+fn render_terminal_chunk(
     channel: u32,
     bytes: &[u8],
     timestamp: Instant,
@@ -556,10 +556,10 @@ fn render_events(
             ChannelPayload::Bytes(bytes) => {
                 if let Some(logger) = logger.as_deref_mut() {
                     logger
-                        .write_decoded(event.channel_idx, bytes, state.channel_labels)
+                        .write_terminal(event.channel_idx, bytes, state.channel_labels)
                         .map_err(io_error)?;
                 }
-                render_ascii_chunk(event.channel_idx, bytes, event.timestamp, state, output)?
+                render_terminal_chunk(event.channel_idx, bytes, event.timestamp, state, output)?
             }
             ChannelPayload::Defmt(frame) => {
                 if let (Some(level), Some(filters)) = (frame.level, filters) {
@@ -582,7 +582,7 @@ fn render_events(
                 line.push('\n');
                 if let Some(logger) = logger.as_deref_mut() {
                     logger
-                        .write_decoded(event.channel_idx, line.as_bytes(), state.channel_labels)
+                        .write_text(event.channel_idx, line.as_bytes(), state.channel_labels)
                         .map_err(io_error)?;
                 }
                 let level_color = if state.color {
@@ -608,7 +608,7 @@ fn render_events(
                 );
                 if let Some(logger) = logger.as_deref_mut() {
                     logger
-                        .write_decoded(event.channel_idx, line.as_bytes(), state.channel_labels)
+                        .write_text(event.channel_idx, line.as_bytes(), state.channel_labels)
                         .map_err(io_error)?;
                 }
                 render_complete_line(
@@ -1191,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn redirected_ascii_output_buffers_fragments_until_a_complete_line() {
+    fn redirected_terminal_output_buffers_fragments_until_a_complete_line() {
         let mut state = SessionState::new();
         state.interactive = false;
         let mut output = Vec::new();
@@ -1242,7 +1242,7 @@ mod tests {
         state.channel_labels = true;
         let mut output = Vec::new();
 
-        render_ascii_chunk(
+        render_terminal_chunk(
             0,
             b"first\r\nsecond\r\n",
             Instant::now(),
@@ -1260,8 +1260,8 @@ mod tests {
         state.channel_labels = true;
         let mut output = Vec::new();
 
-        render_ascii_chunk(0, b"> ", Instant::now(), &mut state, &mut output).unwrap();
-        render_ascii_chunk(0, b"help\r\n", Instant::now(), &mut state, &mut output).unwrap();
+        render_terminal_chunk(0, b"> ", Instant::now(), &mut state, &mut output).unwrap();
+        render_terminal_chunk(0, b"help\r\n", Instant::now(), &mut state, &mut output).unwrap();
 
         assert_eq!(output, b"[ch0] > \r\x1b[2K[ch0] > help\r\n");
     }
@@ -1273,7 +1273,7 @@ mod tests {
             chip: "nRF52840_xxAA".to_string(),
             up_specs: vec![ChannelSpec {
                 index: 2,
-                mode: ChannelEncoding::Ascii,
+                mode: ChannelEncoding::Terminal,
             }],
             down_channel: 1,
             down_configured: true,
@@ -1296,7 +1296,7 @@ mod tests {
         let config_output = String::from_utf8(output).unwrap();
         assert!(config_output.contains("Probe: probe-id"));
         assert!(config_output.contains("Chip: nRF52840_xxAA"));
-        assert!(config_output.contains("Up channels: 2:ascii"));
+        assert!(config_output.contains("Up channels: 2:terminal"));
         assert!(config_output.contains("Down channel: 1"));
         assert!(config_output.contains("Poll interval: 10 ms"));
 

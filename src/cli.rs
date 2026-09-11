@@ -25,14 +25,14 @@ impl std::str::FromStr for ProbeInfo {
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum ChannelEncoding {
-    Ascii,
+    Terminal,
     Defmt,
 }
 
 impl ChannelEncoding {
     pub(crate) fn name(self) -> &'static str {
         match self {
-            ChannelEncoding::Ascii => "ascii",
+            ChannelEncoding::Terminal => "terminal",
             ChannelEncoding::Defmt => "defmt",
         }
     }
@@ -43,10 +43,10 @@ impl std::str::FromStr for ChannelEncoding {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "ascii" => Ok(ChannelEncoding::Ascii),
+            "terminal" => Ok(ChannelEncoding::Terminal),
             "defmt" => Ok(ChannelEncoding::Defmt),
             _ => Err(format!(
-                "invalid channel mode '{value}', expected ascii or defmt"
+                "invalid channel mode '{value}', expected terminal or defmt"
             )),
         }
     }
@@ -64,7 +64,7 @@ impl std::str::FromStr for ChannelSpec {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let mut parts = value.split(':');
         let index = parts.next().unwrap_or_default();
-        let mode = parts.next().unwrap_or("ascii");
+        let mode = parts.next().unwrap_or("terminal");
 
         if parts.next().is_some() {
             return Err(format!(
@@ -144,7 +144,7 @@ pub(crate) struct Opts {
         long,
         action = clap::ArgAction::Append,
         value_name = "CHANNEL[:MODE]",
-        help = "Up channel specification. MODE is ascii or defmt; defaults to ascii. May be repeated."
+        help = "Up channel specification. MODE is terminal or defmt; defaults to terminal. May be repeated."
     )]
     pub(crate) up: Vec<ChannelSpec>,
 
@@ -222,7 +222,7 @@ pub(crate) struct Opts {
         long,
         value_enum,
         requires = "log",
-        help = "Log raw bytes or decoded text. Defaults to decoded."
+        help = "Log raw bytes or cleaned decoded text. Defaults to decoded."
     )]
     pub(crate) log_format: Option<LogFormat>,
 
@@ -355,7 +355,7 @@ pub(crate) fn configured_up_specs(specs: &[ChannelSpec]) -> Vec<ChannelSpec> {
     if specs.is_empty() {
         vec![ChannelSpec {
             index: 0,
-            mode: ChannelEncoding::Ascii,
+            mode: ChannelEncoding::Terminal,
         }]
     } else {
         specs.to_vec()
@@ -368,23 +368,23 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn channel_spec_defaults_to_ascii() {
+    fn channel_spec_defaults_to_terminal() {
         assert_eq!(
             "7".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 7,
-                mode: ChannelEncoding::Ascii,
+                mode: ChannelEncoding::Terminal,
             })
         );
     }
 
     #[test]
-    fn channel_spec_parses_ascii_and_defmt_modes() {
+    fn channel_spec_parses_terminal_and_defmt_modes() {
         assert_eq!(
-            "1:ascii".parse::<ChannelSpec>(),
+            "1:terminal".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: 1,
-                mode: ChannelEncoding::Ascii,
+                mode: ChannelEncoding::Terminal,
             })
         );
         assert_eq!(
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn channel_spec_rejects_invalid_values() {
-        for value in ["", ":ascii", "1:", "1:ascii:x", "-1", "not-a-channel"] {
+        for value in ["", ":terminal", "1:", "1:terminal:x", "-1", "not-a-channel"] {
             assert!(value.parse::<ChannelSpec>().is_err(), "accepted {value:?}");
         }
 
@@ -412,25 +412,26 @@ mod tests {
             "4294967295".parse::<ChannelSpec>(),
             Ok(ChannelSpec {
                 index: u32::MAX,
-                mode: ChannelEncoding::Ascii,
+                mode: ChannelEncoding::Terminal,
             })
         );
     }
 
     #[test]
     fn opts_accept_repeated_channel_specs_in_order() {
-        let opts = Opts::try_parse_from(["brtt", "-u", "3:ascii", "--up", "4", "-d", "2"]).unwrap();
+        let opts =
+            Opts::try_parse_from(["brtt", "-u", "3:terminal", "--up", "4", "-d", "2"]).unwrap();
 
         assert_eq!(
             opts.up,
             vec![
                 ChannelSpec {
                     index: 3,
-                    mode: ChannelEncoding::Ascii,
+                    mode: ChannelEncoding::Terminal,
                 },
                 ChannelSpec {
                     index: 4,
-                    mode: ChannelEncoding::Ascii,
+                    mode: ChannelEncoding::Terminal,
                 },
             ]
         );
@@ -567,7 +568,7 @@ mod tests {
             configured_up_specs(&[]),
             vec![ChannelSpec {
                 index: 0,
-                mode: ChannelEncoding::Ascii,
+                mode: ChannelEncoding::Terminal,
             }]
         );
     }
@@ -577,7 +578,7 @@ mod tests {
         let specs = vec![
             ChannelSpec {
                 index: 2,
-                mode: ChannelEncoding::Ascii,
+                mode: ChannelEncoding::Terminal,
             },
             ChannelSpec {
                 index: 5,
