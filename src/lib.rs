@@ -1,5 +1,4 @@
 pub mod rtt;
-pub mod channel;
 
-pub use rtt::{Rtt, ScanRegion, Error};
-pub use channel::{RttChannel, UpChannel, DownChannel, ChannelMode};
+pub use probe_rs::rtt::{ChannelMode, DownChannel, RttChannel, UpChannel};
+pub use rtt::{Error, Rtt, ScanRegion};
