@@ -208,6 +208,7 @@ dependencies = [
  "defmt-parser",
  "env_logger",
  "log",
+ "memchr",
  "probe-rs",
  "unicode-width",
  "vte",

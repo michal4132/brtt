@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 pub use probe_rs::rtt::{try_attach_to_rtt, try_attach_to_rtt_shared, Error, Rtt, ScanRegion};
 
-const SCAN_CHUNK_SIZE: usize = 4096;
+const SCAN_CHUNK_SIZE: usize = 32 * 1024;
+const MIN_SCAN_CHUNK_SIZE: usize = 4 * 1024;
 const RTT_MAGIC_OVERLAP: usize = Rtt::RTT_ID.len() - 1;
 
 /// Attaches to the first valid RTT block found by scanning memory incrementally.
@@ -30,29 +31,48 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
 
     let mut bytes_read = 0usize;
     let mut chunks_read = 0usize;
+    let mut chunk = vec![0u8; SCAN_CHUNK_SIZE];
+    let mut combined = Vec::with_capacity(SCAN_CHUNK_SIZE + RTT_MAGIC_OVERLAP);
+    let mut overlap = Vec::with_capacity(RTT_MAGIC_OVERLAP);
+
     for range in ranges {
         if range.end < range.start {
             continue;
         }
+        overlap.clear();
 
         let mut address = range.start;
-        let mut overlap = Vec::with_capacity(RTT_MAGIC_OVERLAP);
         while address < range.end {
             let remaining = usize::try_from(range.end - address).unwrap_or(usize::MAX);
-            let read_len = remaining.min(SCAN_CHUNK_SIZE);
-            let mut chunk = vec![0u8; read_len];
-            if let Err(error) = core.read(address, &mut chunk) {
-                log::debug!(
-                    "Automatic RTT scan could not read range starting at {address:#010x}: {error}"
-                );
+            let mut read_len = remaining.min(SCAN_CHUNK_SIZE);
+            loop {
+                match core.read(address, &mut chunk[..read_len]) {
+                    Ok(()) => break,
+                    Err(error) if read_len > MIN_SCAN_CHUNK_SIZE => {
+                        read_len = (read_len / 2).max(MIN_SCAN_CHUNK_SIZE);
+                        log::debug!(
+                            "Automatic RTT scan read at {address:#010x} failed; retrying with {read_len} bytes: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        log::debug!(
+                            "Automatic RTT scan could not read range starting at {address:#010x}: {error}"
+                        );
+                        read_len = 0;
+                        break;
+                    }
+                }
+            }
+            if read_len == 0 {
                 break;
             }
             bytes_read += read_len;
             chunks_read += 1;
 
             let overlap_len = overlap.len();
-            let mut combined = overlap;
-            combined.extend_from_slice(&chunk);
+            combined.clear();
+            combined.extend_from_slice(&overlap);
+            combined.extend_from_slice(&chunk[..read_len]);
             let first_new_address = address.saturating_sub(overlap_len as u64);
             let mut search_from = 0;
             while let Some(relative) = find_magic(&combined[search_from..]) {
@@ -73,8 +93,9 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
                 }
             }
 
-            overlap = combined.into_iter().rev().take(RTT_MAGIC_OVERLAP).collect();
-            overlap.reverse();
+            overlap.clear();
+            let tail_start = combined.len().saturating_sub(RTT_MAGIC_OVERLAP);
+            overlap.extend_from_slice(&combined[tail_start..]);
             address += read_len as u64;
         }
     }
@@ -87,8 +108,7 @@ pub fn attach_region_incremental(core: &mut Core<'_>, region: &ScanRegion) -> Re
 }
 
 fn find_magic(data: &[u8]) -> Option<usize> {
-    data.windows(Rtt::RTT_ID.len())
-        .position(|window| window == Rtt::RTT_ID)
+    memchr::memmem::find(data, &Rtt::RTT_ID)
 }
 
 /// Retries incremental automatic RTT attachment until `timeout` expires.
