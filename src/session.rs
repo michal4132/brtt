@@ -1,10 +1,13 @@
 use crate::cli::{ChannelEncoding, ChannelSpec};
 use crate::defmt::{
     decode_frames, filter_level, level_enabled, level_name, DecodeOutput, DecodedFrame, DefmtData,
+    Filter, MAX_DECODE_BUFFERED_BYTES,
 };
-use crate::logger::Logger;
+use crate::logger::{DecodedStream, Logger};
 use anyhow::{bail, Context, Result};
-use brtt::rtt::{try_attach_to_rtt, try_attach_to_rtt_incremental, Rtt, ScanRegion};
+use brtt::rtt::{
+    try_attach_to_rtt, try_attach_to_rtt_incremental, Error as RttError, Rtt, ScanRegion,
+};
 use brtt::RttChannel;
 use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,37 +16,35 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use probe_rs::Core;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::prelude::*;
-use std::io::{stdout, IsTerminal};
+use std::io::{stdout, BufWriter, IsTerminal};
 use std::time::{Duration, Instant};
 
 const RTT_REATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 const TARGET_HALT_TIMEOUT: Duration = Duration::from_millis(100);
-
-#[derive(Debug)]
-struct ChannelEvent {
-    channel_idx: u32,
-    payload: ChannelPayload,
-    timestamp: Instant,
-}
-
-#[derive(Debug)]
-enum ChannelPayload {
-    Bytes(Vec<u8>),
-    Defmt(DecodedFrame),
-    Warning(String),
-}
+const UP_CHANNEL_BUFFER_SIZE: usize = 4096;
+const RTT_READ_BUDGET_PER_POLL: usize = 64 * 1024;
+const MAX_DOWN_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_SESSION_RAW_LINE_BYTES: usize = 4096;
 
 struct UpChannelReader<'table> {
     spec: ChannelSpec,
-    buffer: [u8; 256],
+    channel_number: usize,
+    buffer: Vec<u8>,
     decoder: Option<Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>>,
-    defmt_can_recover: bool,
+    defmt: Option<&'table DefmtData>,
+    defmt_buffered_bytes: usize,
 }
 
 impl<'table> UpChannelReader<'table> {
     fn new(spec: ChannelSpec, defmt: Option<&'table DefmtData>) -> Result<Self> {
+        let channel_number = usize::try_from(spec.index).with_context(|| {
+            format!(
+                "up channel index {} cannot be represented on this host",
+                spec.index
+            )
+        })?;
         let decoder = match (spec.mode, defmt) {
             (ChannelEncoding::Defmt, Some(defmt)) => Some(defmt.table.new_stream_decoder()),
             (ChannelEncoding::Defmt, None) => {
@@ -53,13 +54,15 @@ impl<'table> UpChannelReader<'table> {
         };
         Ok(Self {
             spec,
-            buffer: [0; 256],
+            channel_number,
+            buffer: vec![0; UP_CHANNEL_BUFFER_SIZE],
             decoder,
-            defmt_can_recover: defmt.is_some_and(|defmt| defmt.table.encoding().can_recover()),
+            defmt,
+            defmt_buffered_bytes: 0,
         })
     }
 
-    fn reset(&mut self, defmt: Option<&'table DefmtData>) -> Result<()> {
+    fn restart(&mut self, defmt: Option<&'table DefmtData>) -> Result<()> {
         *self = Self::new(self.spec, defmt)?;
         Ok(())
     }
@@ -75,19 +78,178 @@ struct SessionState {
     color: bool,
     channel_labels: bool,
     last_channel: Option<u32>,
-    streams: HashMap<u32, TextStream>,
+    streams: HashMap<u32, SessionStream>,
     foreground: Option<ForegroundLine>,
     interactive: bool,
-}
-
-struct TextStream {
-    bytes: Vec<u8>,
-    pending_cr: bool,
 }
 
 struct ForegroundLine {
     channel: u32,
     bytes: Vec<u8>,
+}
+
+struct SessionStream {
+    terminal: DecodedStream,
+    raw_line: Vec<u8>,
+    raw_pending_cr: bool,
+    raw_rewrite: bool,
+    raw_escape: Vec<u8>,
+    raw_complete: Vec<(Vec<u8>, bool)>,
+}
+
+impl SessionStream {
+    fn new() -> Self {
+        Self {
+            terminal: DecodedStream::new(),
+            raw_line: Vec::new(),
+            raw_pending_cr: false,
+            raw_rewrite: false,
+            raw_escape: Vec::new(),
+            raw_complete: Vec::new(),
+        }
+    }
+
+    fn consume(&mut self, bytes: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let terminal_complete = self.terminal.consume(bytes);
+        self.consume_raw(bytes);
+        let raw_complete = std::mem::take(&mut self.raw_complete);
+        let complete = terminal_complete
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut line)| {
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                match raw_complete.get(index) {
+                    Some((raw, false)) => raw.clone(),
+                    _ => line,
+                }
+            })
+            .collect();
+        (complete, self.visible_line())
+    }
+
+    fn visible_line(&self) -> Vec<u8> {
+        if self.raw_rewrite {
+            self.terminal.visible_line()
+        } else {
+            self.raw_line.clone()
+        }
+    }
+
+    fn consume_raw(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.raw_pending_cr {
+                self.raw_pending_cr = false;
+                if byte == b'\n' {
+                    self.finish_raw_line();
+                    continue;
+                }
+                self.raw_rewrite = true;
+            }
+
+            match byte {
+                b'\r' => self.raw_pending_cr = true,
+                b'\n' => self.finish_raw_line(),
+                b'\x1b' => {
+                    self.raw_escape.clear();
+                    self.raw_escape.push(byte);
+                    self.push_raw(byte);
+                }
+                byte => {
+                    self.push_raw(byte);
+                    self.update_escape(byte);
+                }
+            }
+        }
+    }
+
+    fn update_escape(&mut self, byte: u8) {
+        if self.raw_escape.is_empty() {
+            return;
+        }
+        self.raw_escape.push(byte);
+        if self.raw_escape.len() == 2 && byte != b'[' {
+            self.raw_rewrite = true;
+            self.raw_escape.clear();
+        } else if self.raw_escape.len() >= 3 && (0x40..=0x7e).contains(&byte) {
+            if !(self.raw_escape[1] == b'[' && byte == b'm') {
+                self.raw_rewrite = true;
+            }
+            self.raw_escape.clear();
+        }
+    }
+
+    fn finish_raw_line(&mut self) {
+        self.raw_complete
+            .push((std::mem::take(&mut self.raw_line), self.raw_rewrite));
+        self.raw_pending_cr = false;
+        self.raw_rewrite = false;
+        self.raw_escape.clear();
+    }
+
+    fn push_raw(&mut self, byte: u8) {
+        if self.raw_line.len() < MAX_SESSION_RAW_LINE_BYTES {
+            self.raw_line.push(byte);
+        } else {
+            self.raw_rewrite = true;
+        }
+    }
+}
+
+struct DownBuffer {
+    bytes: VecDeque<u8>,
+    dropped: u64,
+}
+
+/// Bundled rendering targets passed through polling, commands, and reattach.
+struct OutputContext<'a, W: Write> {
+    state: &'a mut SessionState,
+    logger: Option<&'a mut Logger>,
+    filters: Option<&'a [Filter]>,
+    output: &'a mut W,
+}
+
+impl DownBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::new(),
+            dropped: 0,
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        let space = MAX_DOWN_BUFFER_BYTES.saturating_sub(self.bytes.len());
+        if data.len() > space {
+            let dropped = data.len() - space;
+            self.dropped += dropped as u64;
+            log::warn!("down channel buffer is full; dropping {dropped} byte(s)");
+            self.bytes.extend(data[..space].iter().copied());
+        } else {
+            self.bytes.extend(data.iter().copied());
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
+    fn writable(&mut self) -> &mut [u8] {
+        let (head, _) = self.bytes.as_mut_slices();
+        head
+    }
+
+    fn consume(&mut self, count: usize) {
+        self.bytes.drain(..count);
+    }
 }
 
 impl SessionState {
@@ -107,6 +269,49 @@ impl SessionState {
             interactive: true,
         }
     }
+
+    /// Clears all per-target rendering state after a target restart.
+    fn reset_target(&mut self) {
+        self.line_start = true;
+        self.last_channel = None;
+        self.streams.clear();
+        self.foreground = None;
+    }
+}
+
+fn finish_renderer_before_reset<W: Write>(
+    render: &mut OutputContext<'_, W>,
+) -> std::io::Result<()> {
+    if render.state.interactive {
+        erase_foreground(render.state, render.output)?;
+        return Ok(());
+    }
+
+    let partials: Vec<_> = render
+        .state
+        .streams
+        .iter()
+        .filter_map(|(&channel, stream)| {
+            let bytes = stream.visible_line();
+            if bytes.is_empty() {
+                None
+            } else {
+                Some((channel, bytes))
+            }
+        })
+        .collect();
+    for (channel, bytes) in partials {
+        render_channel_bytes(
+            &bytes,
+            Some(channel),
+            Instant::now(),
+            render.state,
+            render.output,
+        )?;
+        render.output.write_all(b"\n")?;
+        render.state.line_start = true;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,13 +450,10 @@ fn validate_up_specs(rtt: &mut Rtt, specs: &[ChannelSpec]) -> Result<()> {
 
 fn validate_channels(rtt: &mut Rtt, config: &SessionConfig) -> Result<()> {
     validate_up_specs(rtt, &config.up_specs)?;
-    if config.down_configured
-        && channel_by_number(rtt.down_channels(), config.down_channel).is_none()
-    {
-        bail!(
-            "Error: down channel {} does not exist.",
-            config.down_channel
-        );
+    if let Some(down_channel) = config.down_channel {
+        if channel_by_number(rtt.down_channels(), down_channel).is_none() {
+            bail!("Error: down channel {down_channel} does not exist.");
+        }
     }
     Ok(())
 }
@@ -276,65 +478,214 @@ fn reset_and_reattach(
     Ok(())
 }
 
-fn poll_up_channels(
-    rtt: &mut Rtt,
+/// Reattaches after the target restarted and RTT state changed under us.
+fn reattach_after_target_restart<'table, W: Write>(
     core: &mut Core,
-    readers: &mut [UpChannelReader<'_>],
+    rtt: &mut Rtt,
+    config: &'table SessionConfig,
+    up_readers: &mut [UpChannelReader<'table>],
+    down_buf: &mut DownBuffer,
+    render: &mut OutputContext<'_, W>,
+) -> Result<()> {
+    *rtt = if config.automatic_scan {
+        try_attach_to_rtt_incremental(core, RTT_REATTACH_TIMEOUT, &config.scan_region)
+    } else {
+        try_attach_to_rtt(core, RTT_REATTACH_TIMEOUT, &config.scan_region)
+    }
+    .context("Error reattaching to RTT after target restart")?;
+    validate_channels(rtt, config)?;
+    for reader in up_readers {
+        reader.restart(config.defmt.as_ref())?;
+    }
+    finish_renderer_before_reset(render)?;
+    render.state.reset_target();
+    down_buf.clear();
+    if let Some(logger) = render.logger.as_deref_mut() {
+        logger.reset()?;
+    }
+    if render.state.interactive {
+        render
+            .output
+            .write_all(b"\r\nRTT control block changed; reattached to target.\r\n")?;
+        render.output.flush()?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PollStats {
+    bytes: usize,
+    messages: usize,
+}
+
+enum PollOutcome {
+    Data(PollStats),
+    Reattach,
+}
+
+fn process_defmt<'table, W: Write>(
+    decoder: &mut Option<Box<dyn defmt_decoder::StreamDecoder + Send + Sync + 'table>>,
+    defmt: Option<&'table DefmtData>,
+    channel: u32,
+    buffered_bytes: &mut usize,
+    bytes: &[u8],
     locations: Option<&defmt_decoder::Locations>,
-    logger: Option<&mut Logger>,
-) -> Result<Vec<ChannelEvent>> {
-    let mut logger = logger;
-    let mut events = Vec::with_capacity(readers.len());
+    render: &mut OutputContext<'_, W>,
+) -> Result<bool> {
+    if !bytes.is_empty() && buffered_bytes.saturating_add(bytes.len()) > MAX_DECODE_BUFFERED_BYTES {
+        *decoder = Some(
+            defmt
+                .expect("defmt table missing")
+                .table
+                .new_stream_decoder(),
+        );
+        *buffered_bytes = 0;
+        render_defmt_warning(
+            channel,
+            "defmt decoder input exceeded 64 KiB; resetting decoder",
+            Instant::now(),
+            render.state,
+            render.logger.as_deref_mut(),
+            render.output,
+        )?;
+    }
 
-    for reader in readers {
-        let channel = usize::try_from(reader.spec.index).with_context(|| {
-            format!(
-                "up channel index {} cannot be represented on this host",
-                reader.spec.index
-            )
-        })?;
-
-        let count = match channel_by_number(rtt.up_channels(), channel) {
-            Some(channel) => channel.read(core, &mut reader.buffer)?,
-            None => continue,
-        };
-
-        if count > 0 {
-            let timestamp = Instant::now();
-            if let Some(logger) = logger.as_deref_mut() {
-                logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
+    let defmt = defmt.expect("defmt table missing");
+    let can_recover = defmt.table.encoding().can_recover();
+    let decoded = {
+        let decoder = decoder.as_mut().expect("defmt decoder initialized");
+        decode_frames(decoder.as_mut(), bytes, locations, can_recover)
+    };
+    for item in decoded.frames {
+        match item {
+            DecodeOutput::Frame(frame) => {
+                render_defmt_frame(
+                    channel,
+                    &frame,
+                    Instant::now(),
+                    render.filters,
+                    render.state,
+                    render.logger.as_deref_mut(),
+                    render.output,
+                )?;
             }
-            match reader.spec.mode {
-                ChannelEncoding::Terminal => events.push(ChannelEvent {
-                    channel_idx: reader.spec.index,
-                    payload: ChannelPayload::Bytes(reader.buffer[..count].to_vec()),
-                    timestamp,
-                }),
-                ChannelEncoding::Defmt => {
-                    let frames = decode_frames(
-                        &mut **reader.decoder.as_mut().expect("defmt decoder initialized"),
-                        &reader.buffer[..count],
-                        locations,
-                        reader.defmt_can_recover,
-                    )
-                    .with_context(|| {
-                        format!("failed to decode defmt on up channel {}", reader.spec.index)
-                    })?;
-                    events.extend(frames.into_iter().map(|output| ChannelEvent {
-                        channel_idx: reader.spec.index,
-                        payload: match output {
-                            DecodeOutput::Frame(frame) => ChannelPayload::Defmt(frame),
-                            DecodeOutput::Warning(warning) => ChannelPayload::Warning(warning),
-                        },
-                        timestamp,
-                    }));
-                }
-            }
+            DecodeOutput::Warning(warning) => render_defmt_warning(
+                channel,
+                &warning,
+                Instant::now(),
+                render.state,
+                render.logger.as_deref_mut(),
+                render.output,
+            )?,
         }
     }
 
-    events.sort_by_key(|event| event.timestamp);
-    Ok(events)
+    if decoded.restart {
+        *decoder = Some(defmt.table.new_stream_decoder());
+        *buffered_bytes = 0;
+    } else {
+        // Track all input since decoder creation. The decoder does not expose
+        // its internal pending-byte count, so resetting only after a frame
+        // could still allow an incomplete suffix to grow without a bound.
+        *buffered_bytes = buffered_bytes.saturating_add(bytes.len());
+    }
+    Ok(decoded.hit_frame_limit)
+}
+
+fn poll_up_channels<'table, W: Write>(
+    rtt: &mut Rtt,
+    core: &mut Core,
+    readers: &mut [UpChannelReader<'table>],
+    locations: Option<&defmt_decoder::Locations>,
+    render: &mut OutputContext<'_, W>,
+) -> Result<PollOutcome> {
+    let mut stats = PollStats::default();
+
+    let mut made_progress;
+    let mut budget = RTT_READ_BUDGET_PER_POLL;
+    loop {
+        made_progress = false;
+        for reader in readers.iter_mut() {
+            if budget == 0 {
+                break;
+            }
+            let max = reader.buffer.len().min(budget);
+            let count = match channel_by_number(rtt.up_channels(), reader.channel_number) {
+                Some(channel) => match channel.read(core, &mut reader.buffer[..max]) {
+                    Ok(count) => count,
+                    Err(RttError::ReadPointerChanged) => return Ok(PollOutcome::Reattach),
+                    Err(error) => {
+                        return Err(anyhow::Error::from(error)).with_context(|| {
+                            format!("Error reading from RTT up channel {}", reader.spec.index)
+                        });
+                    }
+                },
+                None => 0,
+            };
+            if count == 0 {
+                if reader.spec.mode == ChannelEncoding::Defmt {
+                    while process_defmt(
+                        &mut reader.decoder,
+                        reader.defmt,
+                        reader.spec.index,
+                        &mut reader.defmt_buffered_bytes,
+                        &[],
+                        locations,
+                        render,
+                    )? {}
+                }
+                continue;
+            }
+
+            made_progress = true;
+            budget -= count;
+            stats.bytes += count;
+            if let Some(logger) = render.logger.as_deref_mut() {
+                logger.write_raw(reader.spec.index, &reader.buffer[..count])?;
+            }
+
+            match reader.spec.mode {
+                ChannelEncoding::Terminal => {
+                    render_terminal_event(
+                        reader.spec.index,
+                        &reader.buffer[..count],
+                        Instant::now(),
+                        render.state,
+                        render.logger.as_deref_mut(),
+                        render.output,
+                    )?;
+                    stats.messages += 1;
+                }
+                ChannelEncoding::Defmt => {
+                    let hit_frame_limit = process_defmt(
+                        &mut reader.decoder,
+                        reader.defmt,
+                        reader.spec.index,
+                        &mut reader.defmt_buffered_bytes,
+                        &reader.buffer[..count],
+                        locations,
+                        render,
+                    )?;
+                    if hit_frame_limit {
+                        while process_defmt(
+                            &mut reader.decoder,
+                            reader.defmt,
+                            reader.spec.index,
+                            &mut reader.defmt_buffered_bytes,
+                            &[],
+                            locations,
+                            render,
+                        )? {}
+                    }
+                }
+            }
+        }
+        if !made_progress || budget == 0 {
+            break;
+        }
+    }
+
+    Ok(PollOutcome::Data(stats))
 }
 
 fn render_bytes(
@@ -456,30 +807,15 @@ fn render_terminal_chunk(
     state: &mut SessionState,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    let (complete, partial) = {
-        let stream = state.streams.entry(channel).or_insert_with(|| TextStream {
-            bytes: Vec::new(),
-            pending_cr: false,
-        });
-        let mut complete = Vec::new();
-        for &byte in bytes {
-            if stream.pending_cr {
-                stream.pending_cr = false;
-                if byte == b'\n' {
-                    complete.push(std::mem::take(&mut stream.bytes));
-                    continue;
-                }
-                stream.bytes.clear();
-            }
-            match byte {
-                b'\r' => stream.pending_cr = true,
-                b'\n' => complete.push(std::mem::take(&mut stream.bytes)),
-                byte => stream.bytes.push(byte),
-            }
-        }
-        (complete, stream.bytes.clone())
+    let complete = {
+        let stream = state
+            .streams
+            .entry(channel)
+            .or_insert_with(SessionStream::new);
+        stream.consume(bytes)
     };
 
+    let (complete, partial) = complete;
     for line in complete {
         let foreground = erase_foreground(state, output)?;
         render_channel_bytes(&line, Some(channel), timestamp, state, output)?;
@@ -497,17 +833,20 @@ fn render_terminal_chunk(
         }
     }
 
-    if !partial.is_empty() && state.interactive {
-        if state.foreground.as_ref().map(|line| line.channel) == Some(channel) {
-            erase_foreground(state, output)?;
-        } else if state.foreground.is_some() {
-            return Ok(());
+    if state.interactive {
+        let partial = (!partial.is_empty()).then_some(partial);
+        if let Some(partial) = partial {
+            if state.foreground.as_ref().map(|line| line.channel) == Some(channel) {
+                erase_foreground(state, output)?;
+            } else if state.foreground.is_some() {
+                return Ok(());
+            }
+            render_channel_bytes(&partial, Some(channel), timestamp, state, output)?;
+            state.foreground = Some(ForegroundLine {
+                channel,
+                bytes: partial,
+            });
         }
-        render_channel_bytes(&partial, Some(channel), timestamp, state, output)?;
-        state.foreground = Some(ForegroundLine {
-            channel,
-            bytes: partial,
-        });
     }
     Ok(())
 }
@@ -543,87 +882,89 @@ fn channel_color(channel_idx: u32) -> &'static str {
     ][channel_idx as usize % 6]
 }
 
-fn render_events(
-    events: &[ChannelEvent],
+fn render_terminal_event(
+    channel: u32,
+    bytes: &[u8],
+    timestamp: Instant,
     state: &mut SessionState,
-    filters: Option<&[(String, defmt_parser::Level)]>,
     logger: Option<&mut Logger>,
     output: &mut impl Write,
 ) -> std::io::Result<()> {
-    let mut logger = logger;
-    for event in events {
-        match &event.payload {
-            ChannelPayload::Bytes(bytes) => {
-                if let Some(logger) = logger.as_deref_mut() {
-                    logger
-                        .write_terminal(event.channel_idx, bytes, state.channel_labels)
-                        .map_err(io_error)?;
-                }
-                render_terminal_chunk(event.channel_idx, bytes, event.timestamp, state, output)?
-            }
-            ChannelPayload::Defmt(frame) => {
-                if let (Some(level), Some(filters)) = (frame.level, filters) {
-                    let minimum = filter_level(frame.module.as_deref(), filters);
-                    if !level_enabled(level, minimum) {
-                        continue;
-                    }
-                }
-                let mut line = String::new();
-                if let Some(timestamp) = &frame.timestamp {
-                    line.push('[');
-                    line.push_str(timestamp);
-                    line.push_str("] ");
-                }
-                if let Some(level) = frame.level {
-                    line.push_str(level_name(level));
-                    line.push(' ');
-                }
-                line.push_str(&frame.message);
-                line.push('\n');
-                if let Some(logger) = logger.as_deref_mut() {
-                    logger
-                        .write_text(event.channel_idx, line.as_bytes(), state.channel_labels)
-                        .map_err(io_error)?;
-                }
-                let level_color = if state.color {
-                    let color = defmt_level_color(frame.level);
-                    (!color.is_empty()).then_some(color)
-                } else {
-                    None
-                };
-                render_complete_line(
-                    event.channel_idx,
-                    line.as_bytes(),
-                    event.timestamp,
-                    level_color,
-                    state,
-                    output,
-                )?;
-            }
-            ChannelPayload::Warning(warning) => {
-                state.defmt_decode_warnings += 1;
-                let line = format!(
-                    "[defmt warning #{}] {warning}\n",
-                    state.defmt_decode_warnings
-                );
-                if let Some(logger) = logger.as_deref_mut() {
-                    logger
-                        .write_text(event.channel_idx, line.as_bytes(), state.channel_labels)
-                        .map_err(io_error)?;
-                }
-                render_complete_line(
-                    event.channel_idx,
-                    line.as_bytes(),
-                    event.timestamp,
-                    None,
-                    state,
-                    output,
-                )?;
-            }
+    if let Some(logger) = logger {
+        logger
+            .write_terminal(channel, bytes, state.channel_labels)
+            .map_err(io_error)?;
+    }
+    render_terminal_chunk(channel, bytes, timestamp, state, output)
+}
+
+fn render_defmt_frame(
+    channel: u32,
+    frame: &DecodedFrame,
+    timestamp: Instant,
+    filters: Option<&[Filter]>,
+    state: &mut SessionState,
+    logger: Option<&mut Logger>,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    if let (Some(level), Some(filters)) = (frame.level, filters) {
+        let minimum = filter_level(frame.module.as_deref(), filters);
+        if !level_enabled(level, minimum) {
+            return Ok(());
         }
     }
+    let mut line = String::new();
+    if let Some(timestamp) = &frame.timestamp {
+        line.push('[');
+        line.push_str(timestamp);
+        line.push_str("] ");
+    }
+    if let Some(level) = frame.level {
+        line.push_str(level_name(level));
+        line.push(' ');
+    }
+    line.push_str(&frame.message);
+    line.push('\n');
+    if let Some(logger) = logger {
+        logger
+            .write_text(channel, line.as_bytes(), state.channel_labels)
+            .map_err(io_error)?;
+    }
+    let level_color = if state.color {
+        let color = defmt_level_color(frame.level);
+        (!color.is_empty()).then_some(color)
+    } else {
+        None
+    };
+    render_complete_line(
+        channel,
+        line.as_bytes(),
+        timestamp,
+        level_color,
+        state,
+        output,
+    )
+}
 
-    output.flush()
+fn render_defmt_warning(
+    channel: u32,
+    warning: &str,
+    timestamp: Instant,
+    state: &mut SessionState,
+    logger: Option<&mut Logger>,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    state.defmt_decode_warnings += 1;
+    let line = format!(
+        "[defmt warning #{}] {warning}\n",
+        state.defmt_decode_warnings
+    );
+    if let Some(logger) = logger {
+        logger
+            .write_text(channel, line.as_bytes(), state.channel_labels)
+            .map_err(io_error)?;
+    }
+    render_complete_line(channel, line.as_bytes(), timestamp, None, state, output)
 }
 
 fn defmt_level_color(level: Option<defmt_parser::Level>) -> &'static str {
@@ -669,8 +1010,8 @@ fn write_config(
         write!(output, " {}:{}", spec.index, spec.mode.name())?;
     }
     write!(output, "\r\n")?;
-    if config.down_configured {
-        write!(output, "  Down channel: {}\r\n", config.down_channel)?;
+    if let Some(down_channel) = config.down_channel {
+        write!(output, "  Down channel: {down_channel}\r\n")?;
     } else {
         write!(output, "  Down channel: disabled\r\n")?;
     }
@@ -709,69 +1050,78 @@ fn interactive_input_available(has_down_channel: bool) -> bool {
     has_down_channel && std::io::stdin().is_terminal()
 }
 
-fn dispatch_command<'table>(
+fn dispatch_command<'table, W: Write>(
     command: SessionCommand,
     core: &mut Core,
     rtt: &mut Rtt,
     config: &'table SessionConfig,
     up_readers: &mut [UpChannelReader<'table>],
-    state: &mut SessionState,
-    output: &mut impl Write,
+    down_buf: &mut DownBuffer,
+    render: &mut OutputContext<'_, W>,
 ) -> Result<bool> {
     if command == SessionCommand::Quit {
         return Ok(true);
     }
-    let suspended = erase_foreground(state, output)?;
+    let restore_foreground = command != SessionCommand::ResetTarget;
+    let suspended = erase_foreground(render.state, render.output)?;
     match command {
         SessionCommand::Quit => unreachable!("quit handled before rendering command output"),
         SessionCommand::Help => {
-            write_help(output)?;
-            state.line_start = true;
+            write_help(render.output)?;
+            render.state.line_start = true;
         }
         SessionCommand::ShowConfig => {
-            write_config(config, state, output)?;
-            state.line_start = true;
+            write_config(config, render.state, render.output)?;
+            render.state.line_start = true;
         }
         SessionCommand::ClearScreen => {
-            clear_screen(output)?;
-            state.line_start = true;
+            clear_screen(render.output)?;
+            render.state.line_start = true;
         }
         SessionCommand::ToggleTimestamps => {
-            state.timestamps = !state.timestamps;
-            write_toggle_status(output, "Timestamps", state.timestamps)?;
-            output.flush()?;
-            state.line_start = true;
+            render.state.timestamps = !render.state.timestamps;
+            write_toggle_status(render.output, "Timestamps", render.state.timestamps)?;
+            render.output.flush()?;
+            render.state.line_start = true;
         }
         SessionCommand::ToggleLocalEcho => {
-            state.local_echo = !state.local_echo;
-            write_toggle_status(output, "Local echo", state.local_echo)?;
-            output.flush()?;
-            state.line_start = true;
+            render.state.local_echo = !render.state.local_echo;
+            write_toggle_status(render.output, "Local echo", render.state.local_echo)?;
+            render.output.flush()?;
+            render.state.line_start = true;
         }
         SessionCommand::ResetTarget => {
             reset_and_reattach(core, rtt, &config.scan_region, config.automatic_scan)?;
             validate_channels(rtt, config)?;
             for reader in up_readers {
-                reader.reset(config.defmt.as_ref())?;
+                reader.restart(config.defmt.as_ref())?;
             }
-            write!(output, "\r\nTarget reset.\r\n")?;
-            output.flush()?;
-            state.line_start = true;
+            finish_renderer_before_reset(render)?;
+            render.state.reset_target();
+            down_buf.clear();
+            if let Some(logger) = render.logger.as_deref_mut() {
+                logger.reset()?;
+            }
+            write!(render.output, "\r\nTarget reset.\r\n")?;
+            render.output.flush()?;
+            render.state.line_start = true;
         }
     }
 
-    if let Some(saved) = suspended {
-        state.line_start = true;
-        state.last_channel = None;
-        render_channel_bytes_colored_inner(
-            &saved.bytes,
-            Some(saved.channel),
-            Instant::now(),
-            state,
-            output,
-            None,
-        )?;
-        state.foreground = Some(saved);
+    if restore_foreground {
+        if let Some(saved) = suspended {
+            render.state.line_start = true;
+            render.state.last_channel = None;
+            render_channel_bytes_colored_inner(
+                &saved.bytes,
+                Some(saved.channel),
+                Instant::now(),
+                render.state,
+                render.output,
+                None,
+            )?;
+            render.state.foreground = Some(saved);
+        }
     }
 
     Ok(false)
@@ -781,13 +1131,12 @@ pub(crate) struct SessionConfig {
     pub(crate) probe: String,
     pub(crate) chip: String,
     pub(crate) up_specs: Vec<ChannelSpec>,
-    pub(crate) down_channel: usize,
-    pub(crate) down_configured: bool,
+    pub(crate) down_channel: Option<usize>,
     pub(crate) poll_interval: Duration,
     pub(crate) reset: bool,
     pub(crate) timestamps: bool,
     pub(crate) defmt: Option<DefmtData>,
-    pub(crate) defmt_filters: Option<Vec<(String, defmt_parser::Level)>>,
+    pub(crate) defmt_filters: Option<Vec<Filter>>,
     pub(crate) color: crate::cli::ColorMode,
     pub(crate) log: Option<std::path::PathBuf>,
     pub(crate) log_per_channel: bool,
@@ -825,7 +1174,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         config.up_specs.len(),
     )?;
 
-    let mut down_buf = Vec::new();
+    let mut down_buf = DownBuffer::new();
     let mut escape_state = EscapeState::Normal;
     let mut state = SessionState::new();
     state.timestamps = config.timestamps;
@@ -839,13 +1188,12 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
                 && std::env::var_os("NO_COLOR").is_none()
         }
     };
-    let stdin_setup = config.down_configured
-        && interactive_input_available(
-            channel_by_number(rtt.down_channels(), config.down_channel).is_some(),
-        );
+    let stdin_setup = config.down_channel.is_some_and(|down_channel| {
+        interactive_input_available(channel_by_number(rtt.down_channels(), down_channel).is_some())
+    });
     if stdin_setup {
         // Ask the target shell to redraw its normal prompt at session start.
-        down_buf.push(b'\n');
+        down_buf.push(b"\n");
     }
 
     let _raw_mode = if stdin_setup {
@@ -855,41 +1203,61 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
         None
     };
 
-    let mut output = stdout();
+    let locations = config
+        .defmt
+        .as_ref()
+        .and_then(|defmt| defmt.locations.as_ref());
+    let filters = config.defmt_filters.as_deref();
+
+    let mut output = BufWriter::new(stdout().lock());
     if state.interactive {
         write_session_banner(&mut output)?;
     }
     let result = 'read_loop: loop {
-        let events = match poll_up_channels(
-            &mut rtt,
-            core,
-            &mut up_readers,
-            config
-                .defmt
-                .as_ref()
-                .and_then(|defmt| defmt.locations.as_ref()),
-            logger.as_mut(),
-        ) {
-            Ok(events) => events,
-            Err(err) => {
-                break 'read_loop Err(anyhow::anyhow!("\nError reading from RTT: {err}"));
+        let mut render = OutputContext {
+            state: &mut state,
+            logger: logger.as_mut(),
+            filters,
+            output: &mut output,
+        };
+        let stats = match poll_up_channels(&mut rtt, core, &mut up_readers, locations, &mut render)
+        {
+            Ok(PollOutcome::Data(stats)) => stats,
+            Ok(PollOutcome::Reattach) => {
+                if let Err(err) = reattach_after_target_restart(
+                    core,
+                    &mut rtt,
+                    &config,
+                    &mut up_readers,
+                    &mut down_buf,
+                    &mut render,
+                ) {
+                    break 'read_loop Err(err);
+                }
+                continue 'read_loop;
             }
+            Err(err) => break 'read_loop Err(err),
         };
 
-        if !events.is_empty() {
-            if let Err(err) = render_events(
-                &events,
-                &mut state,
-                config.defmt_filters.as_deref(),
-                logger.as_mut(),
-                &mut output,
-            ) {
+        let had_data = stats.bytes > 0 || stats.messages > 0;
+        if had_data {
+            if let Some(logger) = render.logger.as_deref_mut() {
+                if let Err(err) = logger.flush_files() {
+                    break 'read_loop Err(err);
+                }
+            }
+            if let Err(err) = render.output.flush() {
                 break 'read_loop Err(anyhow::anyhow!("Error writing to stdout: {err}"));
             }
         }
 
-        if stdin_setup {
-            let input_ready = match event::poll(config.poll_interval) {
+        if stdin_setup && down_buf.len() < MAX_DOWN_BUFFER_BYTES {
+            let timeout = if had_data {
+                Duration::ZERO
+            } else {
+                config.poll_interval
+            };
+            let input_ready = match event::poll(timeout) {
                 Ok(ready) => ready,
                 Err(err) => break 'read_loop Err(err.into()),
             };
@@ -904,16 +1272,24 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
 
                     match action {
                         InputAction::Send(bytes) => {
-                            if state.local_echo {
-                                if let Err(err) =
-                                    render_bytes(&bytes, Instant::now(), &mut state, &mut output)
-                                {
+                            if render.state.local_echo {
+                                if let Err(err) = render_bytes(
+                                    &bytes,
+                                    Instant::now(),
+                                    render.state,
+                                    render.output,
+                                ) {
                                     break 'read_loop Err(anyhow::anyhow!(
                                         "Error writing local echo: {err}"
                                     ));
                                 }
+                                if let Err(err) = render.output.flush() {
+                                    break 'read_loop Err(anyhow::anyhow!(
+                                        "Error writing to stdout: {err}"
+                                    ));
+                                }
                             }
-                            down_buf.extend_from_slice(&bytes);
+                            down_buf.push(&bytes);
                         }
                         InputAction::Command(command) => {
                             match dispatch_command(
@@ -922,11 +1298,17 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
                                 &mut rtt,
                                 &config,
                                 &mut up_readers,
-                                &mut state,
-                                &mut output,
+                                &mut down_buf,
+                                &mut render,
                             ) {
                                 Ok(true) => break 'read_loop Ok(()),
-                                Ok(false) => {}
+                                Ok(false) => {
+                                    if let Err(err) = render.output.flush() {
+                                        break 'read_loop Err(anyhow::anyhow!(
+                                            "Error writing to stdout: {err}"
+                                        ));
+                                    }
+                                }
                                 Err(err) => break 'read_loop Err(err),
                             }
                         }
@@ -934,15 +1316,15 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
                     }
                 }
             }
-        } else {
+        } else if !had_data {
             std::thread::sleep(config.poll_interval);
         }
 
-        if config.down_configured {
-            if let Some(down_channel) = channel_by_number(rtt.down_channels(), config.down_channel)
+        if let Some(down_channel_number) = config.down_channel {
+            if let Some(down_channel) = channel_by_number(rtt.down_channels(), down_channel_number)
             {
                 if !down_buf.is_empty() {
-                    let count = match down_channel.write(core, down_buf.as_mut()) {
+                    let count = match down_channel.write(core, down_buf.writable()) {
                         Ok(count) => count,
                         Err(err) => {
                             break 'read_loop Err(anyhow::anyhow!("\nError writing to RTT: {err}"));
@@ -950,7 +1332,7 @@ pub(crate) fn run_session(core: &mut Core, mut rtt: Rtt, config: SessionConfig) 
                     };
 
                     if count > 0 {
-                        down_buf.drain(..count);
+                        down_buf.consume(count);
                     }
                 }
             }
@@ -1197,34 +1579,23 @@ mod tests {
         let mut output = Vec::new();
         let timestamp = Instant::now();
 
-        render_events(
-            &[ChannelEvent {
-                channel_idx: 0,
-                payload: ChannelPayload::Bytes(b"partial ".to_vec()),
-                timestamp,
-            }],
-            &mut state,
-            None,
-            None,
-            &mut output,
-        )
-        .unwrap();
+        render_terminal_chunk(0, b"partial ", timestamp, &mut state, &mut output).unwrap();
         assert!(output.is_empty());
 
-        render_events(
-            &[ChannelEvent {
-                channel_idx: 0,
-                payload: ChannelPayload::Bytes(b"line\n".to_vec()),
-                timestamp,
-            }],
-            &mut state,
-            None,
-            None,
-            &mut output,
-        )
-        .unwrap();
+        render_terminal_chunk(0, b"line\n", timestamp, &mut state, &mut output).unwrap();
 
         assert_eq!(output, b"partial line\n");
+    }
+
+    #[test]
+    fn bare_carriage_return_overwrites_from_column_zero() {
+        let mut state = SessionState::new();
+        state.interactive = false;
+        let mut output = Vec::new();
+
+        render_terminal_chunk(0, b"abcdef\rxy\n", Instant::now(), &mut state, &mut output).unwrap();
+
+        assert_eq!(output, b"xycdef\n");
     }
 
     #[test]
@@ -1275,8 +1646,7 @@ mod tests {
                 index: 2,
                 mode: ChannelEncoding::Terminal,
             }],
-            down_channel: 1,
-            down_configured: true,
+            down_channel: Some(1),
             poll_interval: Duration::from_millis(10),
             reset: false,
             timestamps: false,
@@ -1306,47 +1676,27 @@ mod tests {
     }
 
     #[test]
-    fn channel_events_are_rendered_with_channel_labels_in_event_order() {
-        let events = vec![
-            ChannelEvent {
-                channel_idx: 2,
-                payload: ChannelPayload::Bytes(b"log\n".to_vec()),
-                timestamp: Instant::now(),
-            },
-            ChannelEvent {
-                channel_idx: 0,
-                payload: ChannelPayload::Bytes(b"shell".to_vec()),
-                timestamp: Instant::now(),
-            },
-        ];
+    fn terminal_chunks_are_rendered_with_channel_labels_in_read_order() {
         let mut output = Vec::new();
         let mut state = SessionState::new();
         state.channel_labels = true;
+        let timestamp = Instant::now();
 
-        render_events(&events, &mut state, None, None, &mut output).unwrap();
+        render_terminal_chunk(2, b"log\n", timestamp, &mut state, &mut output).unwrap();
+        render_terminal_chunk(0, b"shell", timestamp, &mut state, &mut output).unwrap();
 
         assert_eq!(output, b"[ch2] log\r\n[ch0] shell");
     }
 
     #[test]
     fn multiple_channels_are_labeled_on_each_line() {
-        let events = vec![
-            ChannelEvent {
-                channel_idx: 0,
-                payload: ChannelPayload::Bytes(b"zero\none".to_vec()),
-                timestamp: Instant::now(),
-            },
-            ChannelEvent {
-                channel_idx: 1,
-                payload: ChannelPayload::Bytes(b"one\n".to_vec()),
-                timestamp: Instant::now(),
-            },
-        ];
         let mut output = Vec::new();
         let mut state = SessionState::new();
         state.channel_labels = true;
+        let timestamp = Instant::now();
 
-        render_events(&events, &mut state, None, None, &mut output).unwrap();
+        render_terminal_chunk(0, b"zero\none", timestamp, &mut state, &mut output).unwrap();
+        render_terminal_chunk(1, b"one\n", timestamp, &mut state, &mut output).unwrap();
 
         assert_eq!(
             output,
@@ -1359,62 +1709,139 @@ mod tests {
         assert_eq!(channel_color(0), "\x1b[36m");
         assert_eq!(channel_color(6), channel_color(0));
 
-        let events = vec![ChannelEvent {
-            channel_idx: 1,
-            payload: ChannelPayload::Bytes(b"line\n".to_vec()),
-            timestamp: Instant::now(),
-        }];
         let mut output = Vec::new();
         let mut state = SessionState::new();
         state.channel_labels = true;
         state.color = true;
 
-        render_events(&events, &mut state, None, None, &mut output).unwrap();
+        render_terminal_chunk(1, b"line\n", Instant::now(), &mut state, &mut output).unwrap();
 
         assert_eq!(output, b"\x1b[35m[ch1] \x1b[0mline\r\n");
     }
 
     #[test]
     fn defmt_level_color_composes_after_channel_color() {
-        let events = vec![ChannelEvent {
-            channel_idx: 1,
-            payload: ChannelPayload::Defmt(DecodedFrame {
-                message: "bad".to_string(),
-                timestamp: None,
-                level: Some(defmt_parser::Level::Error),
-                module: None,
-            }),
-            timestamp: Instant::now(),
-        }];
+        let frame = DecodedFrame {
+            message: "bad".to_string(),
+            timestamp: None,
+            level: Some(defmt_parser::Level::Error),
+            module: None,
+        };
         let mut output = Vec::new();
         let mut state = SessionState::new();
         state.channel_labels = true;
         state.color = true;
 
-        render_events(&events, &mut state, None, None, &mut output).unwrap();
+        render_defmt_frame(
+            1,
+            &frame,
+            Instant::now(),
+            None,
+            &mut state,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         assert_eq!(output, b"\x1b[35m[ch1] \x1b[0m\x1b[31merror bad\r\n\x1b[0m");
     }
 
     #[test]
     fn filtered_defmt_frames_are_not_rendered_or_logged() {
-        let events = vec![ChannelEvent {
-            channel_idx: 0,
-            payload: ChannelPayload::Defmt(DecodedFrame {
-                message: "quiet".to_string(),
-                timestamp: None,
-                level: Some(defmt_parser::Level::Info),
-                module: Some("app".to_string()),
-            }),
-            timestamp: Instant::now(),
+        let frame = DecodedFrame {
+            message: "quiet".to_string(),
+            timestamp: None,
+            level: Some(defmt_parser::Level::Info),
+            module: Some("app".to_string()),
+        };
+        let filters = vec![Filter {
+            module: "".into(),
+            level: defmt_parser::Level::Warn,
         }];
-        let filters = vec![(String::new(), defmt_parser::Level::Warn)];
         let mut output = Vec::new();
         let mut state = SessionState::new();
 
-        render_events(&events, &mut state, Some(&filters), None, &mut output).unwrap();
+        render_defmt_frame(
+            0,
+            &frame,
+            Instant::now(),
+            Some(&filters),
+            &mut state,
+            None,
+            &mut output,
+        )
+        .unwrap();
 
         assert!(output.is_empty());
         assert_eq!(state.defmt_decode_warnings, 0);
+    }
+
+    #[test]
+    fn reset_target_clears_renderer_state_and_queued_input() {
+        let mut state = SessionState::new();
+        state.line_start = false;
+        state.last_channel = Some(1);
+        state.foreground = Some(ForegroundLine {
+            channel: 1,
+            bytes: b"> ".to_vec(),
+        });
+        state.streams.insert(1, SessionStream::new());
+
+        state.reset_target();
+
+        assert!(state.line_start);
+        assert_eq!(state.last_channel, None);
+        assert!(state.foreground.is_none());
+        assert!(state.streams.is_empty());
+
+        let mut down = DownBuffer::new();
+        down.push(b"typed but unsent");
+        down.clear();
+        assert!(down.is_empty());
+    }
+
+    #[test]
+    fn down_buffer_caps_growth_and_drops_excess() {
+        let mut down = DownBuffer::new();
+        let chunk = vec![b'x'; MAX_DOWN_BUFFER_BYTES + 32];
+
+        down.push(&chunk);
+
+        assert_eq!(down.bytes.len(), MAX_DOWN_BUFFER_BYTES);
+        assert_eq!(down.dropped, 32);
+        assert_eq!(down.writable().len(), MAX_DOWN_BUFFER_BYTES);
+
+        down.consume(16);
+        assert_eq!(down.bytes.len(), MAX_DOWN_BUFFER_BYTES - 16);
+    }
+
+    #[test]
+    fn terminal_lines_are_bounded_instead_of_growing_without_bound() {
+        let mut state = SessionState::new();
+        state.interactive = false;
+        let mut output = Vec::new();
+        let long = vec![b'a'; 16 * 1024 + 64];
+
+        render_terminal_chunk(0, &long, Instant::now(), &mut state, &mut output).unwrap();
+        render_terminal_chunk(0, b"\n", Instant::now(), &mut state, &mut output).unwrap();
+
+        assert_eq!(output.len(), 4097);
+    }
+
+    #[test]
+    fn terminal_output_preserves_sgr_colors_without_cursor_rewrites() {
+        let mut state = SessionState::new();
+        let mut output = Vec::new();
+
+        render_terminal_chunk(
+            0,
+            b"\x1b[31mred\x1b[0m\n",
+            Instant::now(),
+            &mut state,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(output, b"\x1b[31mred\x1b[0m\r\n");
     }
 }

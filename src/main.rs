@@ -3,7 +3,7 @@ mod defmt;
 mod logger;
 mod session;
 
-use brtt::rtt::{attach_region_incremental, Rtt};
+use brtt::rtt::{try_attach_to_rtt, try_attach_to_rtt_incremental};
 use brtt::RttChannel;
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +14,8 @@ use session::{run_session, SessionConfig};
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
+const RTT_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brtt=warn"))
         .format(|buffer, record| writeln!(buffer, "[brtt {}] {}", record.level(), record.args()))
@@ -22,18 +24,24 @@ fn main() -> Result<()> {
 
     let up_specs = configured_up_specs(&opts.up);
     opts.validate(&up_specs)?;
-    let defmt_filters = opts
-        .defmt_filter
-        .as_deref()
-        .map(defmt::parse_filter_spec)
-        .transpose()?;
-    let defmt_data = defmt::require_elf(
-        opts.elf.as_deref(),
-        opts.debug_defmt_table
-            || up_specs
-                .iter()
-                .any(|spec| spec.mode == ChannelEncoding::Defmt),
-    )?;
+    let defmt_filters = opts.defmt_filters.map(|spec| spec.0);
+    let has_defmt = opts.debug_defmt_table
+        || up_specs
+            .iter()
+            .any(|spec| spec.mode == ChannelEncoding::Defmt);
+    let elf_bytes = opts.elf.as_deref().map(defmt::read_elf).transpose()?;
+    let defmt_data = if has_defmt {
+        let path = opts
+            .elf
+            .as_deref()
+            .context("--elf is required when using an up channel with :defmt")?;
+        let bytes = elf_bytes
+            .as_deref()
+            .context("failed to read the ELF provided via --elf")?;
+        Some(defmt::DefmtData::load(path, bytes)?)
+    } else {
+        None
+    };
     if opts.debug_defmt_table {
         let data = defmt_data.as_ref().ok_or_else(|| {
             anyhow::anyhow!("--debug-defmt-table requires --elf with a defmt table")
@@ -42,11 +50,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let elf_region = opts
-        .elf
-        .as_deref()
-        .map(defmt::rtt_region_from_elf)
-        .transpose()?;
+    let elf_region = match (opts.elf.as_deref(), elf_bytes.as_deref()) {
+        (Some(path), Some(bytes)) => Some(defmt::rtt_region_from_elf(path, bytes)?),
+        _ => None,
+    };
+    drop(elf_bytes);
 
     let lister = Lister::new();
     let probes = lister.list_all();
@@ -120,9 +128,9 @@ fn main() -> Result<()> {
     eprintln!("Attaching to RTT...");
 
     let mut rtt = if automatic_scan {
-        attach_region_incremental(&mut core, &scan_region)
+        try_attach_to_rtt_incremental(&mut core, RTT_ATTACH_TIMEOUT, &scan_region)
     } else {
-        Rtt::attach_region(&mut core, &scan_region)
+        try_attach_to_rtt(&mut core, RTT_ATTACH_TIMEOUT, &scan_region)
     }
     .context("Error attaching to RTT")?;
     eprintln!("Found control block at {:#010x}", rtt.ptr());
@@ -137,11 +145,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let down_channel = opts
-        .down
-        .unwrap_or(0)
-        .try_into()
-        .context("down channel index cannot be represented on this host")?;
+    let down_channel = if opts.no_down {
+        None
+    } else {
+        Some(
+            opts.down
+                .unwrap_or(0)
+                .try_into()
+                .context("down channel index cannot be represented on this host")?,
+        )
+    };
 
     run_session(
         &mut core,
@@ -151,7 +164,6 @@ fn main() -> Result<()> {
             chip,
             up_specs,
             down_channel,
-            down_configured: !opts.no_down,
             poll_interval: Duration::from_millis(opts.poll_interval),
             reset: opts.reset,
             timestamps: opts.timestamps,

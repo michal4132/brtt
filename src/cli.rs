@@ -1,3 +1,4 @@
+use crate::defmt::FilterSpec;
 use anyhow::{bail, Result};
 use brtt::rtt::ScanRegion;
 use std::collections::HashSet;
@@ -198,11 +199,12 @@ pub(crate) struct Opts {
     pub(crate) debug_defmt_table: bool,
 
     #[clap(
-        long,
+        long = "defmt-filter",
+        value_parser = crate::defmt::parse_filter_spec_value,
         value_name = "SPEC",
         help = "Filter defmt output, e.g. warn or app=debug,warn."
     )]
-    pub(crate) defmt_filter: Option<String>,
+    pub(crate) defmt_filters: Option<FilterSpec>,
 
     #[clap(long, value_enum, default_value_t = ColorMode::Auto, help = "Terminal color mode for channel labels and defmt levels.")]
     pub(crate) color: ColorMode,
@@ -267,7 +269,7 @@ impl Opts {
         let has_defmt = up_specs
             .iter()
             .any(|spec| spec.mode == ChannelEncoding::Defmt);
-        if self.defmt_filter.is_some() && !has_defmt {
+        if self.defmt_filters.is_some() && !has_defmt {
             bail!("--defmt-filter requires at least one up channel using :defmt");
         }
         if has_defmt && self.elf.is_none() {
@@ -305,7 +307,7 @@ impl Opts {
             || self.log.is_some()
             || self.log_per_channel
             || self.log_format.is_some()
-            || self.defmt_filter.is_some()
+            || self.defmt_filters.is_some()
             || self.poll_interval != 10
     }
 
@@ -335,14 +337,13 @@ impl Opts {
     }
 
     fn validate_filter(&self) -> Result<()> {
-        if let Some(filter) = self.defmt_filter.as_deref() {
-            let parsed = crate::defmt::parse_filter_spec(filter)?;
+        if let Some(spec) = &self.defmt_filters {
             let mut prefixes = HashSet::new();
-            for (prefix, _) in parsed {
-                if !prefixes.insert(prefix.clone()) {
+            for filter in &spec.0 {
+                if !prefixes.insert(filter.module.clone()) {
                     bail!(
                         "defmt filter prefix '{}' was specified more than once",
-                        prefix
+                        filter.module
                     );
                 }
             }
